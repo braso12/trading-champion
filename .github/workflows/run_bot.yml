@@ -1,0 +1,42 @@
+name: Evolutionary Champion Heartbeat
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Descarcă codul din repository
+        uses: actions/checkout@v4
+
+      - name: 2. Instalează Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Instalează librăria Alpaca
+        run: pip install alpaca-py pandas numpy
+
+      - name: 4. Trezire Agent & Verificare Piață
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          STARTING_CAPITAL: ${{ secrets.STARTING_CAPITAL }}
+        run: python github_champion.py
+
+      - name: 5. Dacă agentul a murit, salvează certificatul DEAD.lock în repo
+        run: |
+          if [ -f "DEAD.lock" ]; then
+            git config --global user.name "Reaper Bot"
+            git config --global user.email "reaper@github.com"
+            git add DEAD.lock
+            git commit -m "💀 KILL-SWITCH ACTIVATED: Agent died at -20% drawdown"
+            git push
+          fi
