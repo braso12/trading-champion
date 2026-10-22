@@ -18,7 +18,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 # ==========================================
-# 1. CREDENȚIALE & PIEȚE MONITORIZATE
+# 1. CREDENȚIALE & CONFIGURARE TURBO (1 MINUT)
 # ==========================================
 API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
@@ -28,34 +28,42 @@ if not API_KEY or not SECRET_KEY:
     print("❌ EROARE: Cheile ALPACA_API_KEY și ALPACA_SECRET_KEY lipsesc din GitHub Secrets!")
     sys.exit(1)
 
-# Lista de Criptomonede (tranzacționate 24/7)
 CRYPTO_SYMBOLS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD",
     "XRP/USD", "AVAX/USD", "LINK/USD", "LTC/USD"
 ]
-
-# Lista de Acțiuni SUA & ETF-uri (tranzacționate când bursa din New York e deschisă)
 STOCK_SYMBOLS = ["NVDA", "TSLA", "AAPL", "SPY"]
 
-# ADN-ul Campionului (Multi-Asset)
+# ADN SCALPING (Acțiune rapidă pe graficul de 1 minut)
 CHAMPION_DNA = {
-    'fast_ma': 12,               # Media rapidă (12 ore)
-    'slow_ma': 45,               # Media lentă (45 ore)
-    'max_positions': 5,          # Deține simultan cel mult 5 monede/acțiuni
-    'allocation_per_asset': 0.19,# Alocă ~19% din capital per activ (ca să poată cumpăra 5 diferite)
-    'take_profit_pct': 0.15,     # Încasează profitul la +15%
-    'stop_loss_pct': 0.20        # Stop-Loss individual pe server la -20%
+    'fast_ma': 5,                # Media pe ultimele 5 minute (reacție instantanee)
+    'slow_ma': 15,               # Media pe ultimele 15 minute
+    'rsi_period': 14,            # Perioada RSI pentru a cumpăra scăderile bruște (Buy the Dip)
+    'max_positions': 5,          # Maximum 5 poziții simultane
+    'allocation_per_asset': 0.19,# ~19% din capital per monedă/acțiune
+    'take_profit_pct': 0.008,    # Încasează profitul rapid la +0.8% creștere!
+    'quick_cut_pct': -0.025,     # Taie rapid poziția dacă scade cu -2.5% ca să elibereze banii
+    'stop_loss_pct': 0.15        # Gardianul de urgență pe serverul Alpaca
 }
 
-MAX_DRAWDOWN_PCT = 0.20
+MAX_DRAWDOWN_PCT = 0.20          # MOARTE DEFINITIVĂ dacă tot contul pierde 20% (80.000$)
 DEATH_FILE = "DEAD.lock"
+CYCLES_PER_RUN = 5               # Execută 5 scanări la 60 de secunde distanță în fiecare rulare
 
 
 # ==========================================
-# 2. FUNCȚII AJUTĂTOARE PENTRU ORDINE
+# 2. FUNCȚII AJUTĂTOARE & INDICATORI RAPIZI
 # ==========================================
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1]) if not rsi.empty else 50.0
+
+
 def cancel_orders_for_symbol(trading_client, symbol, pos_symbol):
-    """Anulează DOAR ordinele Stop-Loss ale monedei pe care vrem să o vindem, fără să strice protecția celorlalte."""
     open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
     for order in open_orders:
         if order.symbol in [symbol, pos_symbol]:
@@ -63,9 +71,8 @@ def cancel_orders_for_symbol(trading_client, symbol, pos_symbol):
 
 
 def get_precision_qty(price, invest_usd, is_crypto=True):
-    """Calculează cantitatea rotunjită corect în funcție de prețul monedei/acțiunii."""
     if not is_crypto:
-        return int(invest_usd // price)  # La acțiuni cu ordin Bracket cumpărăm acțiuni întregi
+        return int(invest_usd // price)
     raw_qty = invest_usd / price
     if price >= 1000:
         return round(raw_qty, 5)
@@ -76,57 +83,50 @@ def get_precision_qty(price, invest_usd, is_crypto=True):
 
 
 # ==========================================
-# 3. MOTORUL MULTI-PIAȚĂ (SINGLE-SHOT)
+# 3. MOTORUL SCALPING (LA 60 DE SECUNDE)
 # ==========================================
-def run_multi_market_cycle():
+def run_fast_cycle(trading_client, crypto_client, stock_client):
     if os.path.exists(DEATH_FILE):
         print("💀 Agentul este deja MORT (DEAD.lock există). Oprire.")
         sys.exit(0)
 
-    trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-    crypto_client = CryptoHistoricalDataClient()
-    stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
     death_threshold = STARTING_CAPITAL * (1.0 - MAX_DRAWDOWN_PCT)
 
-    # 1. VERIFICARE KILL-SWITCH GLOBAL (-20% PE TOT PORTOFOLIUL)
+    # 1. VERIFICARE KILL-SWITCH GLOBAL (-20%)
     account = trading_client.get_account()
     current_equity = float(account.equity)
     available_cash = float(account.cash)
+    pnl_total = current_equity - STARTING_CAPITAL
     drawdown_pct = ((STARTING_CAPITAL - current_equity) / STARTING_CAPITAL) * 100
 
-    print(f"⏰ Rulare Multi-Piață: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print(f"💰 Equity Total: {current_equity:.2f}$ | Cash liber: {available_cash:.2f}$ | Prag Moarte: {death_threshold:.2f}$ ({drawdown_pct:+.2f}%)\n")
+    print(f"\n⚡ Scanare Rapidă (1m): {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+    print(f"💰 Equity: {current_equity:.2f}$ (Profit/Pierdere Totală: {pnl_total:+.2f}$) | Cash: {available_cash:.2f}$ | Prag Moarte: {death_threshold:.2f}$")
 
     if current_equity <= death_threshold:
-        print("🚨 [KILL-SWITCH ACTIVAT] Portofoliul total a scăzut cu 20%!")
+        print("🚨 [KILL-SWITCH ACTIVAT] Portofoliul a scăzut cu 20%!")
         trading_client.cancel_orders()
         time.sleep(1)
         trading_client.close_all_positions(cancel_orders=True)
         with open(DEATH_FILE, "w") as f:
             f.write(f"Killed at {datetime.now(timezone.utc)} with equity {current_equity:.2f}$\n")
-        print("💀 Toate monedele și acțiunile au fost vândute. Certificatul DEAD.lock a fost creat.")
+        print("💀 Toate pozițiile au fost lichidate. DEAD.lock creat.")
         sys.exit(0)
 
-    # Preluăm toate pozițiile deja deschise în portofoliu
     all_positions = trading_client.get_all_positions()
     held_map = {p.symbol: p for p in all_positions}
     open_positions_count = len(held_map)
 
-    # Verificăm dacă bursa de acțiuni SUA este deschisă acum
     clock = trading_client.get_clock()
     is_stock_market_open = clock.is_open
-    print(f"📂 Poziții deschise acum: {open_positions_count}/{CHAMPION_DNA['max_positions']} | Bursa SUA deschisă: {'DA 🟢' if is_stock_market_open else 'NU (Doar Crypto 24/7) 🌙'}")
 
-    lookback_hours = CHAMPION_DNA['slow_ma'] + 25
-    start_time = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-
+    # Luăm ultimele 60 de minute de lumânări la 1 MINUT
+    start_time = datetime.now(timezone.utc) - timedelta(minutes=60)
     buy_candidates = []
 
-    # 2. SCANARE CRIPTOMONEDE
-    print("\n--- 🔍 SCANARE CRIPTOMONEDE ---")
+    # 2. SCANARE CRIPTOMONEDE LA 1 MINUT
     crypto_bars = crypto_client.get_crypto_bars(CryptoBarsRequest(
         symbol_or_symbols=CRYPTO_SYMBOLS,
-        timeframe=TimeFrame.Hour,
+        timeframe=TimeFrame.Minute,
         start=start_time
     )).df
 
@@ -136,53 +136,68 @@ def run_multi_market_cycle():
             continue
 
         closes = crypto_bars.xs(symbol)['close']
-        if len(closes) < CHAMPION_DNA['slow_ma']:
+        if len(closes) < CHAMPION_DNA['slow_ma'] + 2:
             continue
 
         fast_ma = float(closes.rolling(window=CHAMPION_DNA['fast_ma']).mean().iloc[-1])
         slow_ma = float(closes.rolling(window=CHAMPION_DNA['slow_ma']).mean().iloc[-1])
+        rsi = calculate_rsi(closes, CHAMPION_DNA['rsi_period'])
         price = float(closes.iloc[-1])
         trend_score = ((fast_ma - slow_ma) / slow_ma) * 100
 
         if pos_symbol in held_map:
             pos = held_map[pos_symbol]
             entry_price = float(pos.avg_entry_price)
-            profit_pct = ((price - entry_price) / entry_price) * 100
-            tp_target = entry_price * (1.0 + CHAMPION_DNA['take_profit_pct'])
+            profit_pct = (price - entry_price) / entry_price
 
-            print(f"💼 [DEȚINUT] {symbol:<8} | Preț: {price:<9.3f}$ | Profit: {profit_pct:+.2f}% | Trend: {trend_score:+.2f}%")
+            print(f"💼 [ACTIV]  {symbol:<8} | Preț: {price:<9.3f}$ | Intrare: {entry_price:<9.3f}$ | P/L: {profit_pct*100:+.2f}% | Țintă: +{CHAMPION_DNA['take_profit_pct']*100:.2f}%")
 
-            if price >= tp_target:
-                print(f"   💰 [TAKE-PROFIT] {symbol} a atins +{CHAMPION_DNA['take_profit_pct']*100:.0f}%! Vând și încasez...")
+            # A. Încasare rapidă a profitului (+0.8%)
+            if profit_pct >= CHAMPION_DNA['take_profit_pct']:
+                print(f"   💰 [PROFIT ÎNCASAT] {symbol} a atins {profit_pct*100:+.2f}%! Vând imediat...")
                 cancel_orders_for_symbol(trading_client, symbol, pos_symbol)
                 time.sleep(1)
                 trading_client.close_position(pos_symbol)
                 open_positions_count -= 1
-            elif fast_ma < slow_ma:
-                print(f"   🔴 [SELL] Trendul pe {symbol} s-a inversat! Închid poziția...")
+
+            # B. Ieșire dacă trendul de 1 minut se întoarce și suntem deja pe plus (protejare câștig)
+            elif profit_pct > 0.002 and fast_ma < slow_ma:
+                print(f"   💵 [PROFIT SECURIZAT] Trendul pe {symbol} încetinește la {profit_pct*100:+.2f}%. Încasez câștigul!")
+                cancel_orders_for_symbol(trading_client, symbol, pos_symbol)
+                time.sleep(1)
+                trading_client.close_position(pos_symbol)
+                open_positions_count -= 1
+
+            # C. Tăiere rapidă dacă poziția scade sub -2.5% și trendul e negativ
+            elif profit_pct <= CHAMPION_DNA['quick_cut_pct'] and fast_ma < slow_ma:
+                print(f"   🔴 [STOP RAPID] Eliberez capitalul blocat în {symbol} ({profit_pct*100:+.2f}%)...")
                 cancel_orders_for_symbol(trading_client, symbol, pos_symbol)
                 time.sleep(1)
                 trading_client.close_position(pos_symbol)
                 open_positions_count -= 1
         else:
-            status = "🟢 SEMNAL BUY" if fast_ma > slow_ma else "⚪ În așteptare"
-            print(f"👀 [SCANAT]  {symbol:<8} | Preț: {price:<9.3f}$ | FastMA: {fast_ma:<9.3f} | SlowMA: {slow_ma:<9.3f} | Scor Trend: {trend_score:+.2f}% -> {status}")
-            if fast_ma > slow_ma:
+            # Semnal 1: Trend rapid în urcare (Momentum) | Semnal 2: Supravândut pe 1 minut (Buy the Dip)
+            is_momentum = fast_ma > slow_ma and rsi < 72
+            is_dip_buy = rsi < 32
+            if is_momentum or is_dip_buy:
+                reason = "🚀 MOMENTUM" if is_momentum else f"💎 BUY THE DIP (RSI {rsi:.0f})"
+                score = trend_score if is_momentum else (35 - rsi) * 0.1
+                print(f"🟢 [SEMNAL] {symbol:<8} | Preț: {price:<9.3f}$ | RSI: {rsi:<4.1f} | Motiv: {reason}")
                 buy_candidates.append({
                     'symbol': symbol,
                     'pos_symbol': pos_symbol,
                     'price': price,
-                    'score': trend_score,
-                    'is_crypto': True
+                    'score': score,
+                    'is_crypto': True,
+                    'reason': reason
                 })
 
-    # 3. SCANARE ACȚIUNI SUA (Dacă bursa este deschisă)
+    # 3. SCANARE ACȚIUNI SUA LA 1 MINUT (Când bursa e deschisă)
     if is_stock_market_open:
-        print("\n--- 🏛️ SCANARE ACȚIUNI SUA ---")
         stock_bars = stock_client.get_stock_bars(StockBarsRequest(
             symbol_or_symbols=STOCK_SYMBOLS,
-            timeframe=TimeFrame.Hour,
-            start=start_time - timedelta(days=5),
+            timeframe=TimeFrame.Minute,
+            start=datetime.now(timezone.utc) - timedelta(minutes=120),
             feed=DataFeed.IEX
         )).df
 
@@ -190,53 +205,47 @@ def run_multi_market_cycle():
             if stock_bars.empty or symbol not in stock_bars.index.get_level_values(0):
                 continue
             closes = stock_bars.xs(symbol)['close']
-            if len(closes) < CHAMPION_DNA['slow_ma']:
+            if len(closes) < CHAMPION_DNA['slow_ma'] + 2:
                 continue
 
             fast_ma = float(closes.rolling(window=CHAMPION_DNA['fast_ma']).mean().iloc[-1])
             slow_ma = float(closes.rolling(window=CHAMPION_DNA['slow_ma']).mean().iloc[-1])
+            rsi = calculate_rsi(closes, CHAMPION_DNA['rsi_period'])
             price = float(closes.iloc[-1])
             trend_score = ((fast_ma - slow_ma) / slow_ma) * 100
 
             if symbol in held_map:
                 pos = held_map[symbol]
                 entry_price = float(pos.avg_entry_price)
-                profit_pct = ((price - entry_price) / entry_price) * 100
-                print(f"💼 [DEȚINUT] {symbol:<8} | Preț: {price:<9.2f}$ | Profit: {profit_pct:+.2f}% | Trend: {trend_score:+.2f}%")
-                if fast_ma < slow_ma:
-                    print(f"   🔴 [SELL] Trend inversat pe acțiunea {symbol}! Vând poziția...")
+                profit_pct = (price - entry_price) / entry_price
+                print(f"💼 [ACTIV]  {symbol:<8} | Preț: {price:<9.2f}$ | P/L: {profit_pct*100:+.2f}%")
+                if profit_pct >= CHAMPION_DNA['take_profit_pct'] or (profit_pct > 0.002 and fast_ma < slow_ma):
+                    print(f"   💰 [PROFIT ÎNCASAT ACȚIUNI] Vând {symbol} la {profit_pct*100:+.2f}%!")
                     cancel_orders_for_symbol(trading_client, symbol, symbol)
                     time.sleep(1)
                     trading_client.close_position(symbol)
                     open_positions_count -= 1
             else:
-                status = "🟢 SEMNAL BUY" if fast_ma > slow_ma else "⚪ În așteptare"
-                print(f"👀 [SCANAT]  {symbol:<8} | Preț: {price:<9.2f}$ | Scor Trend: {trend_score:+.2f}% -> {status}")
-                if fast_ma > slow_ma:
+                if (fast_ma > slow_ma and rsi < 72) or rsi < 32:
                     buy_candidates.append({
                         'symbol': symbol,
                         'pos_symbol': symbol,
                         'price': price,
-                        'score': trend_score,
-                        'is_crypto': False
+                        'score': trend_score + 0.5,
+                        'is_crypto': False,
+                        'reason': "🏛️ STOCK SCALP"
                     })
 
-    # 4. ALOCAREA CAPITALULUI ÎN CELE MAI PUTERNICE PIEȚE
+    # 4. EXECUȚIA CUMPĂRĂRILOR RAPIDE
     slots_available = CHAMPION_DNA['max_positions'] - open_positions_count
     if slots_available > 0 and buy_candidates:
-        # Sortăm oportunitățile descrescător după puterea trendului
         buy_candidates.sort(key=lambda x: x['score'], reverse=True)
-        selected_targets = buy_candidates[:slots_available]
-
-        print(f"\n🎯 Top oportunități selectate pentru cumpărare ({len(selected_targets)} locuri libere în portofoliu):")
-        for target in selected_targets:
+        for target in buy_candidates[:slots_available]:
             account = trading_client.get_account()
             available_cash = float(account.cash)
-            # Fiecare monedă primește ~19% din valoarea portofoliului (sau cash-ul rămas)
             invest_usd = min(available_cash * 0.95, current_equity * CHAMPION_DNA['allocation_per_asset'])
 
             if invest_usd < 50.0:
-                print("⚠️ Cash insuficient pentru o nouă poziție.")
                 break
 
             sym = target['symbol']
@@ -247,43 +256,47 @@ def run_multi_market_cycle():
             if qty <= 0:
                 continue
 
+            print(f"⚡ [CUMPĂRARE RAPIDĂ] {qty} {sym} (~{invest_usd:.0f}$) -> {target['reason']}")
             if target['is_crypto']:
-                print(f"🟢 [CRYPTO BUY] Cumpăr {qty} {sym} (~{invest_usd:.2f}$) | Putere Trend: {target['score']:+.2f}%")
                 trading_client.submit_order(MarketOrderRequest(
                     symbol=sym, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
                 ))
-                time.sleep(3)
-
-                # Plantăm Stop-Loss-ul de -20% pe serverul Alpaca pentru această monedă
+                time.sleep(2)
                 try:
                     pos = trading_client.get_open_position(pos_sym)
                     actual_qty = float(pos.qty)
                     actual_entry = float(pos.avg_entry_price)
                     stop_price = round(actual_entry * (1.0 - CHAMPION_DNA['stop_loss_pct']), 4 if price < 10 else 2)
                     limit_price = round(stop_price * 0.99, 4 if price < 10 else 2)
-
                     trading_client.submit_order(StopLimitOrderRequest(
                         symbol=sym, qty=actual_qty, side=OrderSide.SELL,
                         time_in_force=TimeInForce.GTC, stop_price=stop_price, limit_price=limit_price
                     ))
-                    print(f"   🛡️ Stop-Loss plantat pe server pentru {sym} la {stop_price}$")
-                except Exception as e:
-                    print(f"   ⚠️ Nu s-a putut atașa Stop-Loss imediat pentru {sym}: {e}")
-
+                except Exception:
+                    pass
             else:
-                # Pentru Acțiuni SUA folosim ordinul BRACKET nativ (Take-Profit + Stop-Loss incluse)
                 stop_price = round(price * (1.0 - CHAMPION_DNA['stop_loss_pct']), 2)
                 tp_price = round(price * (1.0 + CHAMPION_DNA['take_profit_pct']), 2)
-                print(f"🟢 [STOCK BRACKET BUY] Cumpăr {qty} acțiuni {sym} (~{invest_usd:.2f}$) | TP: {tp_price}$ | SL: {stop_price}$")
                 trading_client.submit_order(MarketOrderRequest(
                     symbol=sym, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC,
                     order_class=OrderClass.BRACKET,
                     take_profit=TakeProfitRequest(limit_price=tp_price),
                     stop_loss=StopLossRequest(stop_price=stop_price)
                 ))
-    else:
-        print("\n✅ Nicio achiziție nouă necesară în acest ciclu (fie portofoliul are deja 5 poziții, fie piețele sunt în scădere).")
 
 
 if __name__ == "__main__":
-    run_multi_market_cycle()
+    trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+    crypto_client = CryptoHistoricalDataClient()
+    stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+
+    print(f"🚀 PORNIT MODUL TURBO: {CYCLES_PER_RUN} scanări la interval de 60 secunde...")
+    for i in range(CYCLES_PER_RUN):
+        print(f"\n================ CICLUL {i+1}/{CYCLES_PER_RUN} ================")
+        try:
+            run_fast_cycle(trading_client, crypto_client, stock_client)
+        except Exception as e:
+            print(f"⚠️ Eroare temporară în ciclul {i+1}: {e}")
+        
+        if i < CYCLES_PER_RUN - 1:
+            time.sleep(55)
