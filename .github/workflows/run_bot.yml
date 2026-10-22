@@ -1,9 +1,8 @@
 name: Evolutionary Champion Heartbeat
 
 on:
+  push:
   schedule:
-    # Nivelul minim permis de GitHub: pornește la fiecare 5 minute,
-    # iar în interiorul rulării scriptul Python verifică piața în fiecare minut!
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
@@ -41,9 +40,3 @@ jobs:
             git commit -m "💀 KILL-SWITCH ACTIVATED: Agent died at -20% drawdown"
             git push
           fi
-          on:
-  push: # <-- Pornește automat în secunda în care salvezi orice modificare
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch:
-
