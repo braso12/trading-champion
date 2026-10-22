@@ -2,7 +2,9 @@ name: Evolutionary Champion Heartbeat
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    # Nivelul minim permis de GitHub: pornește la fiecare 5 minute,
+    # iar în interiorul rulării scriptul Python verifică piața în fiecare minut!
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -19,17 +21,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: 3. Instalează librăria Alpaca
         run: pip install alpaca-py pandas numpy
 
-      - name: 4. Trezire Agent & Verificare Piață
+      - name: 4. Trezire Agent & Verificare Piață (5 Cicluri x 1 Minut)
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           STARTING_CAPITAL: ${{ secrets.STARTING_CAPITAL }}
-        run: python github_champion.py
+        run: python -u github_champion.py
 
       - name: 5. Dacă agentul a murit, salvează certificatul DEAD.lock în repo
         run: |
