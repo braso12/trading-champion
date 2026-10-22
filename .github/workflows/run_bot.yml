@@ -41,3 +41,9 @@ jobs:
             git commit -m "💀 KILL-SWITCH ACTIVATED: Agent died at -20% drawdown"
             git push
           fi
+          on:
+  push: # <-- Pornește automat în secunda în care salvezi orice modificare
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
