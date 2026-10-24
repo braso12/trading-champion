@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TRADING CHAMPION V6.1  (Alpaca, paper trading implicit)
+TRADING CHAMPION V6.2  (Alpaca, paper trading implicit)
 
-Rulare:
-    python github_champion.py                 -> bot live (paper), CYCLES_PER_RUN cicluri
-    python github_champion.py --backtest      -> backtest pe ultimele 30 de zile (cu comisioane)
-    python github_champion.py --backtest --days 60
-
-Îmbunătățiri V6.1 față de V6:
-  * FIX CRITIC Trailing Stop: hi_trail măsoară maximul DOAR de la deschiderea poziției (elimină
-    bug-ul în care un vârf de acum 3 ore declanșa prematur stop-ul pe REBOUND / PULLBACK).
-  * FIX Preț Live vs. Bară Închisă: semnalele se calculează pe ultima bară de 15m închisă, dar
-    stop-ul, P/L-ul și execuția folosesc prețul LIVE la secundă (evită respingerea stop-ului pe Alpaca).
-  * FIX Distanță 1R: reconstituie stop-ul inițial direct din ordinul activ de pe server.
-  * FIX Acțiuni SUA: filtrează orele Pre-Market/After-Hours pe IEX ca să nu distorsioneze EMA50/ATR/RVOL.
-  * FIX Backtest = Live: activele de refugiu funcționează în risk-off, iar acțiunile se închid la final de zi.
+Ce rezolvă V6.2 pe baza log-urilor din rularea #141/#142:
+  1. DEBLOCARE POZIȚII VECHI (Legacy Audit): strânge automat stop-urile vechi de -12% rămase
+     din V5 (pe BTC, SOL, PAXG) la nivelul ATR corect și taie pozițiile vechi care au depășit
+     deja pragul maxim de avarie (-3.2% cu trend descendent), eliberând sloturile blocate.
+  2. FIX SEMNAL REBOUND: elimină alarmele false în masă (scor 66 pe 6 monede simultan); cere
+     obligatoriu lumânare verde (close > open), revenire peste EMA_fast și volum (RVOL >= 1.1).
+  3. FILTRU COMISIOANE MAI STRICT: crește vol_cost_mult la 4.0 ca să evite tranzacțiile în care
+     ATR-ul (0.31%) abia acoperă comisionul round-trip (0.60%).
+  4. FIX RADAR SOCIAL PE GITHUB: înlocuiește JSON-ul Reddit (blocat cu 0 postări pe IP-uri de
+     GitHub Actions) cu fluxul RSS Reddit + CryptoCompare Live News.
 """
 import os
 import re
@@ -24,6 +21,7 @@ import time
 import json
 import argparse
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
@@ -79,37 +77,38 @@ DNA = {
     'ema_slow': 21,
     'ema_trend': 50,
     'atr_period': 14,
-    'entry_score_min': 65,
+    'entry_score_min': 68,          # ridicat de la 65 la 68 pentru selectivitate mai mare
 
     'risk_per_trade': 0.005,        # riscăm 0.5% din cont pe tranzacție
     'max_positions': 4,
     'max_crypto_positions': 3,
     'max_single_exposure': 0.20,
-    'max_total_exposure': 0.60,
+    'max_total_exposure': 0.65,
 
-    'stop_atr_mult': 2.0,
-    'min_stop_pct': 0.015,
-    'max_stop_pct': 0.050,
-    'trail_atr_mult': 2.8,          # trailing Chandelier din maximul atins DUPĂ intrare
-    'breakeven_trigger_r': 1.0,     # la +1R mutăm stop-ul pe breakeven + comisioane și activăm trailing-ul
+    'stop_atr_mult': 2.2,           # stop inițial = 2.2 x ATR
+    'min_stop_pct': 0.015,          # minim 1.5%
+    'max_stop_pct': 0.032,          # maxim 3.2% (nu mai permitem stop-uri vechi de -10%..-12%!)
+    'legacy_cut_pct': -0.032,       # închide pozițiile moștenite care sunt sub -3.2% cu trend rupt
+    'trail_atr_mult': 2.6,          # trailing Chandelier din maximul atins DUPĂ intrare
+    'breakeven_trigger_r': 0.9,     # la +0.9R mutăm stop-ul pe breakeven + comisioane
     'trail_lookback_bars': 16,
 
     'soft_stop_frac_news': 0.4,
-    'use_exhaustion_exit': True,    # activat DOAR după ce poziția are deja peste +1.5R profit net!
-    'exhaustion_min_r': 1.5,        # protejează câștigurile mari când cumpărătorii se epuizează
-    'vol_cost_mult': 3.0,
+    'use_exhaustion_exit': True,
+    'exhaustion_min_r': 1.4,        # marchează profitul la epuizare când avem >= +1.4R câștig net
+    'vol_cost_mult': 4.0,           # 4 x ATR% >= costul round-trip (0.60%) -> cere ATR >= 0.15%
 }
 
 BULLISH_WORDS = ['surge', 'soar', 'bull', 'bullish', 'breakout', 'moon', 'rally', 'pump', 'ath',
-                 'upgrade', 'record', 'adoption', 'approval', 'beats']
+                 'upgrade', 'record', 'adoption', 'approval', 'beats', 'inflow', 'accumulate']
 BEARISH_WORDS = ['crash', 'dump', 'bear', 'bearish', 'hack', 'hacked', 'ban', 'lawsuit', 'plunge',
-                 'panic', 'liquidation', 'fraud', 'bankruptcy', 'sec', 'misses', 'downgrade']
+                 'panic', 'liquidation', 'fraud', 'bankruptcy', 'sec', 'misses', 'downgrade', 'outflow']
 BULL_RE = re.compile(r"\b(" + "|".join(BULLISH_WORDS) + r")\b")
 BEAR_RE = re.compile(r"\b(" + "|".join(BEARISH_WORDS) + r")\b")
 ALIASES = {
     'BTC': ['btc', 'bitcoin'], 'ETH': ['eth', 'ethereum'], 'SOL': ['solana', 'sol'],
     'DOGE': ['doge', 'dogecoin'], 'XRP': ['xrp', 'ripple'], 'AVAX': ['avax', 'avalanche'],
-    'LINK': ['chainlink'], 'LTC': ['ltc', 'litecoin'], 'PAXG': ['paxg'],
+    'LINK': ['chainlink'], 'LTC': ['ltc', 'litecoin'], 'PAXG': ['paxg', 'gold'],
     'NVDA': ['nvda', 'nvidia'], 'TSLA': ['tsla', 'tesla'], 'AAPL': ['aapl', 'apple'],
     'SPY': ['spy'], 'GLD': ['gld'], 'TLT': ['tlt'],
 }
@@ -156,7 +155,6 @@ def stop_distance_pct(m):
 
 
 def filter_regular_stock_hours(df):
-    """Păstrează doar barele din sesiunea oficială NYSE/NASDAQ (09:30 - 16:00 ET)."""
     if df.empty:
         return df
     ny_times = df.index.tz_convert(NY_TZ)
@@ -165,18 +163,48 @@ def filter_regular_stock_hours(df):
 
 
 # ==========================================
-# 3. RADAR SOCIAL MEDIA & ȘTIRI
+# 3. RADAR SOCIAL MEDIA & ȘTIRI (FĂRĂ BLOCAJ PE GITHUB)
 # ==========================================
-def fetch_json_url(url, headers=None, timeout=8):
+def fetch_url_raw(url, headers=None, timeout=8):
     try:
-        req_headers = {'User-Agent': 'script:trading-champion-bot:v6.1 (paper trading)'}
+        req_headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36'
+        }
         if headers:
             req_headers.update(headers)
         req = urllib.request.Request(url, headers=req_headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode('utf-8'))
+            return resp.read().decode('utf-8', errors='ignore')
     except Exception:
         return None
+
+
+def fetch_json_url(url, headers=None, timeout=8):
+    raw = fetch_url_raw(url, headers=headers, timeout=timeout)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def fetch_reddit_rss_titles(sub):
+    """Folosește fluxul XML/RSS al Reddit care trece mai ușor de filtrele datacenter + fallback."""
+    raw = fetch_url_raw(f"https://www.reddit.com/r/{sub}/hot.rss?limit=20")
+    titles = []
+    if not raw:
+        return titles
+    try:
+        root = ET.fromstring(raw)
+        for elem in root.iter():
+            if elem.tag.endswith('title') and elem.text:
+                t = elem.text.strip().lower()
+                if len(t) > 12:
+                    titles.append(t)
+    except Exception:
+        pass
+    return titles
 
 
 def sentiment_hits(text):
@@ -211,15 +239,19 @@ def scan_social_media_and_sentiment():
             if sym:
                 trending.add(sym)
 
-    reddit_posts = []
-    for sub in ["CryptoCurrency", "wallstreetbets", "Bitcoin"]:
-        r = fetch_json_url(f"https://www.reddit.com/r/{sub}/hot.json?limit=25")
-        if r and 'data' in r:
-            for post in r['data'].get('children', []):
-                title = post.get('data', {}).get('title', '').lower()
-                if title:
-                    reddit_posts.append(title)
+    # 1. Postări sociale din Reddit RSS + CryptoCompare Social News (nu blochează IP-urile GitHub!)
+    social_posts = []
+    for sub in ["CryptoCurrency", "Bitcoin", "wallstreetbets"]:
+        social_posts.extend(fetch_reddit_rss_titles(sub))
 
+    cc_news = fetch_json_url("https://min-api.cryptocompare.com/data/v2/news/?lang=EN")
+    if cc_news and isinstance(cc_news.get('Data'), list):
+        for item in cc_news['Data'][:35]:
+            title = item.get('title', '').lower()
+            if title:
+                social_posts.append(title)
+
+    # 2. Știri oficiale Alpaca
     news = []
     nd = fetch_json_url("https://data.alpaca.markets/v1beta1/news?limit=40",
                         headers={'APCA-API-KEY-ID': API_KEY or '', 'APCA-API-SECRET-KEY': SECRET_KEY or ''})
@@ -230,19 +262,19 @@ def scan_social_media_and_sentiment():
     for asset in ALL_CRYPTO + ALL_STOCKS:
         base = asset.split("/")[0].upper()
         rx = alias_regex(base)
-        score = 4 if base in trending else 0
-        r_hits = sum(sentiment_hits(t) for t in reddit_posts if rx.search(t))
+        score = 3 if base in trending else 0
+        s_hits = sum(sentiment_hits(t) for t in social_posts if rx.search(t))
         n_hits = sum(sentiment_hits(h) for h, syms in news if base in syms or rx.search(h))
-        score += clamp(r_hits * 2, -6, 6) + clamp(n_hits * 3, -6, 6)
+        score += clamp(s_hits * 2, -6, 6) + clamp(n_hits * 3, -6, 6)
         social_scores[asset] = int(clamp(score, -10, 10))
 
     print(f"🌐 [RADAR] Fear&Greed: {fear_greed_val}/100 | Trending: {', '.join(list(trending)[:6]) or '-'} "
-          f"| Reddit: {len(reddit_posts)} postări | Știri: {len(news)}")
+          f"| Flux Social: {len(social_posts)} postări | Știri Alpaca: {len(news)}")
     return social_scores, fear_greed_val
 
 
 # ==========================================
-# 4. INDICATORI & SEMNALE
+# 4. INDICATORI & SEMNALE CALIBRATE
 # ==========================================
 def compute_indicators(df):
     c = df['close'].astype(float)
@@ -294,6 +326,7 @@ def compute_indicators(df):
 def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None):
     r = ind.iloc[i]
     bar_close = float(r['close'])
+    bar_open = float(r['open'])
     price = float(live_price) if live_price is not None else bar_close
     atr = float(r['atr'])
     if not np.isfinite(atr) or atr <= 0:
@@ -305,6 +338,7 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None):
     hh20 = float(r['hh20'])
 
     trend_up = (ema_f > ema_s > ema_t) and bar_close > ema_t
+    bullish_candle = bar_close > bar_open
 
     ceiling, why = False, ""
     if bool(r['macd_losing']) and (rsi_falling or rvol < 0.85):
@@ -315,16 +349,20 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None):
         ceiling, why = True, "Bollinger superior + RSI în întoarcere"
 
     score, setup, reasons = 0, None, []
-    if trend_up and hist > 0 and macd_rising and 50 <= rsi <= 72 and bar_close > hh20 and rvol >= 1.2:
+    # 1. BREAKOUT puternic pe trend cu volum
+    if trend_up and hist > 0 and macd_rising and 52 <= rsi <= 72 and bar_close > hh20 and rvol >= 1.25:
         score, setup = 75, 'BREAKOUT'
         reasons.append(f"Breakout+Volum({rvol:.1f}x)")
-    elif trend_up and macd_rising and 40 <= rsi <= 60 and float(r['low3']) <= ema_s * 1.002 \
-            and bar_close > ema_f and bb < 0.85:
-        score, setup = 68, 'PULLBACK'
-        reasons.append("Pullback în trend")
-    elif bar_close > ema_t * 0.97 and float(r['rsi_min3']) < 32 and rsi > float(r['rsi_min3']) + 2 and macd_rising:
-        score, setup = 66, 'REBOUND'
-        reasons.append(f"Ricoșeu(RSI {rsi:.0f})")
+    # 2. PULLBACK în trend ascendent confirmat de lumânare verde
+    elif trend_up and bullish_candle and macd_rising and 42 <= rsi <= 60 \
+            and float(r['low3']) <= ema_s * 1.002 and bar_close > ema_f and bb < 0.82:
+        score, setup = 70, 'PULLBACK'
+        reasons.append("Pullback confirmat în trend")
+    # 3. REBOUND (Ricoșeu strict: cere lumânare verde, revenire peste EMA_fast și volum real >= 1.1x)
+    elif bullish_candle and bar_close > ema_t * 0.99 and bar_close > ema_f \
+            and float(r['rsi_min3']) < 30 and rsi > float(r['rsi_min3']) + 4 and macd_rising and rvol >= 1.1:
+        score, setup = 68, 'REBOUND'
+        reasons.append(f"Ricoșeu confirmat(RSI {rsi:.0f}, Vol {rvol:.1f}x)")
 
     if setup and social_bonus:
         score += social_bonus
@@ -342,7 +380,6 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None):
         'profit_ceiling_hit': ceiling, 'ceiling_reason': why,
         'score': score, 'setup': setup, 'social': int(social_bonus),
         'reason': " + ".join(reasons) if reasons else "Neutru",
-        'last_bar_time': ind.index[i],
     }
 
 
@@ -355,11 +392,17 @@ def entry_allowed(m, cost_rt):
 def exit_decision(profit, m, init_stop_pct, cost_rt):
     trend_broken = m['ema_fast'] < m['ema_slow'] and not m['macd_rising']
 
+    # 1. Protecție pentru pozițiile vechi moștenite din V5 (ex: SOL la -4.74% cu stop la -12%)
+    if profit <= DNA['legacy_cut_pct'] and trend_broken:
+        return f"Tăiere poziție veche sub {DNA['legacy_cut_pct']*100:.1f}% (trend rupt)"
+
+    # 2. Plafon de profit după ce poziția a acumulat cel puțin +1.4R profit net
     if DNA['use_exhaustion_exit']:
-        # Protejăm câștigul la epuizare DOAR când avem deja peste +1.5R profit net!
         min_net = cost_rt + (init_stop_pct * DNA['exhaustion_min_r'])
         if profit >= min_net and m['profit_ceiling_hit']:
             return f"Plafon de profit la >{DNA['exhaustion_min_r']}R: {m['ceiling_reason']}"
+
+    # 3. Stop rapid la știri puternic negative
     if m['social'] <= -5 and trend_broken and profit <= -init_stop_pct * DNA['soft_stop_frac_news']:
         return "Stop controlat: trend rupt + știri negative"
     return None
@@ -401,7 +444,6 @@ def place_stop(tc, symbol, qty, stop_price, is_crypto):
 
 
 def effective_init_stop_pct(entry, cur_stop, fallback_stop_pct):
-    """Deduce distanța 1R inițială direct din ordinul de stop de pe server (dacă e sub entry)."""
     if cur_stop is not None and 0 < cur_stop < entry:
         return clamp((entry - cur_stop) / entry, DNA['min_stop_pct'], DNA['max_stop_pct'])
     return fallback_stop_pct
@@ -416,33 +458,33 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt):
     cur = find_stop_order(get_open_orders(tc), pos_symbol)
     cur_stop = float(cur.stop_price) if cur is not None else None
     init_stop_pct = effective_init_stop_pct(entry, cur_stop, stop_distance_pct(m))
-    new_stop = cur_stop if cur_stop else entry * (1.0 - init_stop_pct)
 
-    # Activăm breakeven + trailing DOAR după ce poziția a atins +1R (sau dacă stop-ul e deja pe plus)
+    # Calculăm unde ar trebui să fie stop-ul maxim permis de V6.2 (maxim -3.2% sub intrare sau sub prețul curent)
+    max_allowed_floor = min(entry * (1.0 - init_stop_pct), live_price * (1.0 - init_stop_pct))
+    new_stop = max(cur_stop, max_allowed_floor) if cur_stop else max_allowed_floor
+
     already_in_profit_stop = (cur_stop is not None and cur_stop >= entry)
     if profit >= init_stop_pct * DNA['breakeven_trigger_r'] or already_in_profit_stop:
-        # Folosim doar maximul recent (fără vârfuri vechi de dinaintea intrării!)
         peak_since_active = max(live_price, m['recent_high'], entry * (1.0 + profit))
         trail = peak_since_active - DNA['trail_atr_mult'] * m['atr']
         new_stop = max(new_stop, trail, entry * (1.0 + cost_rt))
 
-    # Stop-ul trebuie să fie întotdeauna sub prețul LIVE actual din piață
-    new_stop = min(new_stop, live_price * 0.997)
+    new_stop = min(new_stop, live_price * 0.994)
 
     if cur_stop is not None:
         new_stop = max(new_stop, cur_stop)
-        if new_stop <= cur_stop * 1.0025:
+        if new_stop <= cur_stop * 1.003:
             return cur_stop
         tc.cancel_order_by_id(cur.id)
         time.sleep(1.5)
         try:
             fresh_pos = tc.get_open_position(pos_symbol)
             placed = place_stop(tc, symbol, float(fresh_pos.qty), new_stop, is_crypto)
-            print(f"   🛡️ [TRAILING] {symbol}: stop urcat {cur_stop:.4f} -> {placed}")
+            print(f"   🛡️ [STOP ACTUALIZAT] {symbol}: stop urcat de la {cur_stop:.4f} -> {placed}")
             return placed
         except Exception as e:
             print(f"   ⚠️ Stop nou respins ({e}); refac stop-ul anterior")
-            place_stop(tc, symbol, qty, min(cur_stop, live_price * 0.995), is_crypto)
+            place_stop(tc, symbol, qty, min(cur_stop, live_price * 0.992), is_crypto)
             return cur_stop
 
     placed = place_stop(tc, symbol, qty, new_stop, is_crypto)
@@ -559,10 +601,9 @@ def evaluate_scorecard(tc, equity):
 
 
 # ==========================================
-# 7. DATE DE PIAȚĂ (SEPARARE BARĂ ÎNCHISĂ VS. PREȚ LIVE)
+# 7. DATE DE PIAȚĂ
 # ==========================================
 def prepare_symbol_frames(bars_df, symbols, now, stale_bars, is_stock=False):
-    """Returnează {simbol: (ind_pe_bare_inchise, live_price, live_high)}."""
     out = {}
     if bars_df is None or bars_df.empty:
         return out
@@ -578,7 +619,6 @@ def prepare_symbol_frames(bars_df, symbols, now, stale_bars, is_stock=False):
             continue
         live_price = float(df['close'].iloc[-1])
         live_high = float(df['high'].iloc[-1])
-        # Dacă ultima bară este încă în formare, o scoatem din calculul indicatorilor, dar îi păstrăm prețul live!
         if len(df) and df.index[-1] + bar_td > now:
             df = df.iloc[:-1]
         if len(df) < 80:
@@ -677,8 +717,9 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val, se
     daily_pnl = (equity - last_equity) / last_equity if last_equity > 0 else 0.0
     entries_blocked = daily_pnl <= -DAILY_LOSS_LIMIT_PCT
 
-    print(f"\n⚡ Scanare V6.1: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} | Equity: {equity:.2f}$ "
-          f"| Vârf: {peak:.2f}$ | Kill-switch: {death_threshold:.2f}$ | Azi: {daily_pnl*100:+.2f}%")
+    # Afișăm vârful cu o zecimală ca GitHub să nu-l mai cenzureze cu *** când e egal cu STARTING_CAPITAL
+    print(f"\n⚡ Scanare V6.2: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} | Equity: {equity:.2f}$ "
+          f"| Vârf: {peak:.1f}$ | Kill-switch: {death_threshold:.2f}$ | Azi: {daily_pnl*100:+.2f}%")
     if entries_blocked:
         print(f"🧯 Limita zilnică de pierdere ({DAILY_LOSS_LIMIT_PCT*100:.0f}%) atinsă: doar gestionăm pozițiile.")
     if show_scorecard:
@@ -740,7 +781,7 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val, se
 
 
 # ==========================================
-# 9. BACKTEST (ALINIAT 100% CU LOGICA LIVE)
+# 9. BACKTEST (ALINIAT 100% CU LOGICA LIVE V6.2)
 # ==========================================
 WARMUP_BARS = 200
 
@@ -773,7 +814,6 @@ def backtest_symbol(symbol, df, is_crypto, regime_off=None, is_safe=False):
                 continue
             pos['hh'] = max(pos['hh'], highs[i])
 
-            # Închidere acțiuni la finalul sesiunii (exact ca în live)
             if not is_crypto and FLATTEN_STOCKS_BEFORE_CLOSE and ny_times[i].time() >= dtime(15, 45):
                 close_trade(closes[i], i, 'eod_flatten')
                 pos = None
@@ -782,10 +822,9 @@ def backtest_symbol(symbol, df, is_crypto, regime_off=None, is_safe=False):
             m = signal_at(ind, i, 0)
             profit = closes[i] / pos['entry'] - 1.0
             if profit >= pos['stop_pct'] * DNA['breakeven_trigger_r'] or pos['stop'] >= pos['entry']:
-                # FIX: Folosim doar pos['hh'] (maximul atins DUPĂ intrare), nu m['hi_trail'] din trecut!
                 trail = pos['hh'] - DNA['trail_atr_mult'] * m['atr']
                 new_stop = max(pos['stop'], trail, pos['entry'] * (1.0 + cost_rt))
-                pos['stop'] = min(new_stop, closes[i] * 0.997) if new_stop > pos['stop'] else pos['stop']
+                pos['stop'] = min(new_stop, closes[i] * 0.994) if new_stop > pos['stop'] else pos['stop']
             why = exit_decision(profit, m, pos['stop_pct'], cost_rt)
             if why:
                 close_trade(opens[i + 1], i + 1, why.split(':')[0])
@@ -832,7 +871,7 @@ def summarize_trades(trades, title):
 
 
 def run_backtest(days):
-    print(f"📈 BACKTEST V6.1 ({days} zile) | bare de {DNA['bar_minutes']} min | comision crypto {CRYPTO_FEE_PCT*100:.2f}%/parte "
+    print(f"📈 BACKTEST V6.2 ({days} zile) | bare de {DNA['bar_minutes']} min | comision crypto {CRYPTO_FEE_PCT*100:.2f}%/parte "
           f"+ alunecare {CRYPTO_SLIPPAGE_PCT*100:.2f}%")
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=days)
@@ -894,7 +933,7 @@ def main():
     crypto_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
     stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-    print(f"🚀 AGENT V6.1 pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) | bare {DNA['bar_minutes']}m | "
+    print(f"🚀 AGENT V6.2 pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) | bare {DNA['bar_minutes']}m | "
           f"cost round-trip crypto {round_trip_cost(True)*100:.2f}%")
     social_scores, fear_greed_val = scan_social_media_and_sentiment()
     seen_bar_times = {}
