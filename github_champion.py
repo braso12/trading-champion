@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TRADING CHAMPION V8.2 — TURBO 5m/30s + PRICE ACTION CANDLESTICKS + DUST SWEEPER
+TRADING CHAMPION V8.3 — NIGHT FILTER + PROFIT FLOOR TIGHTENER + MIN SLOT SIZE
 
-Ce include V8.2:
-  1. MOTOR DE LUMÂNĂRI JAPONEZE (fără dependențe C++ externe):
-     - Intrare (Bullish): Hammer (Ciocan), Bullish Engulfing, Morning Star (3 lumânări).
-     - Plafon de Profit (Bearish): Shooting Star (Stea Căzătoare), Bearish Engulfing în vârf.
-  2. CRYPTO DUST SWEEPER: ignoră automat firimiturile sub 5$ (SOLUSD, LTCUSD) ca să nu blocheze
-     cele 5 sloturi de poziții active.
-  3. PRECIZIE 8 ZECIMALE (qty_available + ROUND_DOWN): elimină erorile de balanță pe PAXG/Crypto.
-  4. EXECUȚIE RAPIDĂ: grafic de 5 minute + scanare live la fiecare 30 secunde + Scale-Out 50/50.
+Ce rezolvă V8.3 pe baza capturilor Positions & Orders din 28 Octombrie:
+  1. KILL-SWITCH LA -20% (80.000$): previne lichidarea prematură la 90.000$ a celor 5 poziții reale.
+  2. FILTRU DE NOAPTE (00:00-05:30 UTC / 02:00-07:30 RO): cere scor >= 76 noaptea pentru a opri
+     pierderile din orele cu lichiditate scăzută (2 AM - 6 AM).
+  3. MĂRIME MINIMĂ POZIȚIE (4.000$): nu mai blochează un slot întreg pentru o poziție mică de 1.624$
+     (cum s-a întâmplat pe UNIUSD).
+  4. STRÂNGERE DINAMICĂ A STOP-ULUI (Dynamic Floor): ridică automat stop-urile îndepărtate (precum
+     PAXGUSD de la 3,919$ și SPY de la 752$) mult mai aproape de prețul de intrare când poziția e pe plus.
 """
 import os
 import re
@@ -42,20 +42,22 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 
 # ==========================================
-# 1. CONFIGURARE TURBO V8.2
+# 1. CONFIGURARE V8.3
 # ==========================================
 API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 PAPER = os.environ.get("ALPACA_PAPER", "true").lower() != "false"
 STARTING_CAPITAL = float(os.environ.get("STARTING_CAPITAL", "100000.0"))
 
-MAX_DRAWDOWN_PCT = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.10"))
-DAILY_LOSS_LIMIT_PCT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.03"))
+MAX_DRAWDOWN_PCT = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.20"))          # Kill-switch la -20% (80,000$)
+DAILY_LOSS_LIMIT_PCT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.03"))  # Fără intrări noi la -3% pe zi
 CYCLES_PER_RUN = int(os.environ.get("CYCLES_PER_RUN", "8"))
 CYCLE_SLEEP_SEC = int(os.environ.get("CYCLE_SLEEP_SEC", "30"))
 IGNORE_HISTORY_PEAK = os.environ.get("IGNORE_HISTORY_PEAK", "0") == "1"
 DEATH_FILE = "DEAD.lock"
-DUST_THRESHOLD_USD = 5.0  # Orice poziție sub 5$ este tratată ca "praf" și nu blochează sloturi!
+
+DUST_THRESHOLD_USD = 5.0      # Ignoră firimiturile sub 5$ (AVAX, LTC, SOL dust)
+MIN_POSITION_USD = 4000.0     # Nu ocupă un slot pentru poziții sub 4.000$ (evită micro-pozițiile ca 1.624$ pe UNI)
 
 CRYPTO_FEE_PCT = float(os.environ.get("CRYPTO_FEE_PCT", "0.0025"))
 CRYPTO_SLIPPAGE_PCT = 0.0005
@@ -81,30 +83,31 @@ DNA = {
     'ema_slow': 21,
     'ema_trend': 50,
     'atr_period': 14,
-    'entry_score_min': 66,
+    'entry_score_min': 68,          # Selectivitate crescută ziua
+    'night_score_min': 76,          # Între 00:00 - 05:30 UTC (02:00 - 07:30 RO) intră DOAR pe semnale excepționale!
 
     'base_risk_per_trade': 0.005,
-    'high_conviction_risk': 0.0075,
+    'high_conviction_risk': 0.007,
     'max_positions': 5,
     'max_crypto_positions': 4,
     'max_single_exposure': 0.22,
-    'max_total_exposure': 0.80,
+    'max_total_exposure': 0.85,
 
-    'stop_atr_mult': 2.3,
+    'stop_atr_mult': 2.2,
     'min_stop_pct': 0.012,
-    'max_stop_pct': 0.028,
-    'legacy_cut_pct': -0.030,
-    'trail_atr_mult': 2.3,
-    'breakeven_trigger_r': 0.70,
+    'max_stop_pct': 0.025,          # Redus de la 2.8% la 2.5% pentru a limita pierderea maximă
+    'legacy_cut_pct': -0.028,
+    'trail_atr_mult': 2.1,          # Trailing mai strâns pentru a nu lăsa câștigurile să se întoarcă
+    'breakeven_trigger_r': 0.55,    # Încă de la +0.55R (aprox +0.8%..+1.0%) mută stop-ul pe breakeven+taxe!
 
     'use_partial_tp': True,
-    'partial_tp_r': 0.95,           # Vinde 50% rapid la +0.95R net peste comisioane
-    'spike_harvest_pct': 0.024,     # Încasează spike-urile verticale >= +2.4%
+    'partial_tp_r': 0.85,           # Vinde 50% rapid la +0.85R net peste comisioane
+    'spike_harvest_pct': 0.020,     # Încasează spike-urile verticale >= +2.0%
     'use_exhaustion_exit': True,
-    'exhaustion_min_r': 1.25,       # Marchează profitul când apare Shooting Star / Bearish Engulfing / epuizare
+    'exhaustion_min_r': 1.15,
     'soft_stop_frac_news': 0.4,
-    'vol_cost_mult': 3.2,
-    'reentry_cooldown_min': 15,
+    'vol_cost_mult': 3.5,           # Cere volatilitate mai mare față de comision
+    'reentry_cooldown_min': 30,     # 30 minute pauză după închiderea unei monede
 }
 
 BULLISH_WORDS = ['surge', 'soar', 'bull', 'bullish', 'breakout', 'moon', 'rally', 'pump', 'ath',
@@ -300,7 +303,7 @@ def scan_social_media_and_sentiment():
 
 
 # ==========================================
-# 4. INDICATORI + MOTOR DE LUMÂNĂRI JAPONEZE (PRICE ACTION)
+# 4. INDICATORI + LUMÂNĂRI JAPONEZE (PRICE ACTION)
 # ==========================================
 def compute_indicators(df):
     c = df['close'].astype(float)
@@ -365,9 +368,6 @@ def compute_indicators(df):
     ind['hh12'] = h.shift(1).rolling(12).max()
     ind['low3'] = l.rolling(3).min()
 
-    # ==========================================
-    # DETECTOR VECTORIZAT DE LUMÂNĂRI JAPONEZE
-    # ==========================================
     rng = (h - l).clip(lower=1e-12)
     body = (c - o).abs()
     body_top = pd.concat([c, o], axis=1).max(axis=1)
@@ -382,20 +382,11 @@ def compute_indicators(df):
     prev2_o, prev2_c = o.shift(2), c.shift(2)
     prev2_body = body.shift(2)
 
-    # 1. Bullish Hammer (Ciocan la bază: coadă jos >= 50% din bară, coadă sus mică, închidere sus)
     ind['bull_hammer'] = (lower_wick >= 0.50) & (upper_wick <= 0.22) & (c >= o) & (bb_pos <= 0.58)
-
-    # 2. Bullish Engulfing (Înghițire Crescătoare: lumânarea verde acoperă corpul roșu anterior)
     ind['bull_engulf'] = (prev_c < prev_o) & (c > o) & (c >= prev_o) & (o <= prev_c * 1.001) & (body >= prev_body * 1.05)
-
-    # 3. Morning Star (Luceafărul de Dimineață: bară roșie -> bară mică de ezitare -> bară verde puternică)
     ind['morning_star'] = (prev2_c < prev2_o) & (prev2_body > atr * 0.4) & (prev_body < prev2_body * 0.55) \
                           & (c > o) & (c >= (prev2_o + prev2_c) / 2.0)
-
-    # 4. Shooting Star (Stea Căzătoare în vârf: coadă lungă sus >= 52%, corp jos, în zona superioară Bollinger)
     ind['shooting_star'] = (upper_wick >= 0.52) & (lower_wick <= 0.22) & (body_ratio <= 0.38) & (bb_pos >= 0.70)
-
-    # 5. Bearish Engulfing (Înghițire Descendentă în vârf: lumânare roșie înghite lumânarea verde anterioară)
     ind['bear_engulf'] = (prev_c > prev_o) & (c < o) & (c <= prev_o) & (body >= prev_body * 1.05) & (bb_pos >= 0.65)
 
     return ind
@@ -419,7 +410,6 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
     bb, rvol, wick = float(r['bb_pos']), float(r['rvol']), float(r['wick'])
     hh12 = float(r['hh12'])
 
-    # Citim tiparele de lumânări japoneze
     is_hammer = bool(r['bull_hammer'])
     is_bull_engulf = bool(r['bull_engulf'])
     is_morning_star = bool(r['morning_star'])
@@ -439,7 +429,6 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
     above_vwap = price >= vwap
     bullish_action = (price > bar_open) or (bar_close > bar_open)
 
-    # DETECTOR PLAFON DE PROFIT (include acum Shooting Star și Bearish Engulfing!)
     ceiling, why = False, ""
     if is_bear_engulf:
         ceiling, why = True, "Lumânare Bearish Engulfing în vârf"
@@ -470,12 +459,10 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
             and rsi > float(r['rsi_min3']) + 3.5 and macd_rising and rvol >= 1.05:
         score, setup = 68, 'REBOUND'
         reasons.append(f"Ricoșeu 5m(RSI {rsi:.0f}, Vol {rvol:.1f}x)")
-    # 5. SEMNAL DEDICAT PRICE ACTION (Când apare Hammer / Bullish Engulfing / Morning Star pe trend 1H curat)
     elif candle_bull_name and htf_1h_ok and price > ema_f and macd_rising and 35 <= rsi <= 65 and rvol >= 1.05:
         score, setup = 71, 'PRICE_ACTION'
         reasons.append(f"Tipar {candle_bull_name} + Vol({rvol:.1f}x)")
 
-    # Dacă aveam deja un semnal tehnic și este dublat de o lumânare japoneză Bullish -> +6 puncte Bonus!
     if setup and setup != 'PRICE_ACTION' and candle_bull_name:
         score += 6
         reasons.append(f"🕯️ {candle_bull_name}(+6)")
@@ -513,26 +500,41 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
     }
 
 
-def entry_allowed(m, cost_rt):
-    if not m['setup'] or m['score'] < DNA['entry_score_min'] or m['profit_ceiling_hit']:
+def is_low_liquidity_night(now_utc):
+    """Între 00:00 și 05:30 UTC (02:00 - 07:30 ora României) piața crypto are zgomot/chop ridicat."""
+    t = now_utc.time()
+    return dtime(0, 0) <= t <= dtime(5, 30)
+
+
+def entry_allowed(m, cost_rt, now_utc=None):
+    min_req = DNA['night_score_min'] if (now_utc and is_low_liquidity_night(now_utc)) else DNA['entry_score_min']
+    if not m['setup'] or m['score'] < min_req or m['profit_ceiling_hit']:
         return False
     return m['atr_pct'] * DNA['vol_cost_mult'] >= cost_rt
 
 
-def exit_decision(profit, m, init_stop_pct, cost_rt):
+def exit_decision(profit, m, init_stop_pct, cost_rt, market_val=20000.0):
     trend_broken = m['ema_fast'] < m['ema_slow'] and not m['macd_rising'] and m['price'] < m['vwap']
 
-    if profit >= DNA['spike_harvest_pct'] and (m['rsi'] > 74 or m['profit_ceiling_hit']):
+    # 1. Dacă avem o micro-poziție (< 3.500$, cum e UNIUSD de 1.624$) care stagnează și pierde trendul, eliberăm slotul!
+    if market_val < 3500.0 and profit > -0.008 and trend_broken:
+        return f"Eliberare slot ocupat de micro-poziție ({market_val:.0f}$)"
+
+    # 2. Spike Harvester (>= +2.0%)
+    if profit >= DNA['spike_harvest_pct'] and (m['rsi'] > 73 or m['profit_ceiling_hit']):
         return f"Spike Harvester încasat (+{profit*100:.2f}%)"
 
+    # 3. Tăiere poziție sub -2.8% dacă trendul + VWAP sunt pierdute
     if profit <= DNA['legacy_cut_pct'] and trend_broken:
         return f"Tăiere poziție sub {DNA['legacy_cut_pct']*100:.1f}% (trend + VWAP pierdut)"
 
+    # 4. Plafon de profit la epuizare / Shooting Star / Bearish Engulfing
     if DNA['use_exhaustion_exit']:
         min_net = cost_rt + (init_stop_pct * DNA['exhaustion_min_r'])
         if profit >= min_net and m['profit_ceiling_hit']:
             return f"Plafon de profit la >{DNA['exhaustion_min_r']}R: {m['ceiling_reason']}"
 
+    # 5. Stop controlat la știri negative
     if m['social'] <= -5 and trend_broken and profit <= -init_stop_pct * DNA['soft_stop_frac_news']:
         return "Stop controlat: trend rupt + știri negative"
     return None
@@ -587,7 +589,7 @@ def build_position_memory_and_cooldowns(tc):
 
         for sym, losses in streak_losses.items():
             if losses >= 2 and sym in last_loss_time:
-                if (now - last_loss_time[sym]).total_seconds() < 7200:
+                if (now - last_loss_time[sym]).total_seconds() < 10800:  # 3 ore interdicție după 2 stop-uri
                     cooldown_syms.add(sym)
     except Exception:
         pass
@@ -661,6 +663,7 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
     cur_stop = float(cur.stop_price) if cur is not None else None
     init_stop_pct = effective_init_stop_pct(entry, cur_stop, stop_distance_pct(m))
 
+    # 1. Scale-Out 50% la +0.85R net peste comisioane
     scaled_out = pos_mem.get('scaled_out', False)
     partial_target = cost_rt + init_stop_pct * DNA['partial_tp_r']
     if DNA['use_partial_tp'] and not scaled_out and profit >= partial_target:
@@ -670,7 +673,13 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
             pos_mem['scaled_out'] = True
             return lock_stop
 
+    # 2. Strângere inteligentă a Stop-ului: dacă poziția este deja pe plus (precum PAXGUSD sau SPY),
+    # nu mai lăsăm stop-ul la -3% sub intrare, ci îl ridicăm la cel mult -1.2% sub intrare!
     max_allowed_floor = min(entry * (1.0 - init_stop_pct), live_price * (1.0 - init_stop_pct))
+    if profit >= 0.003:
+        tighter_floor = entry * (1.0 - min(init_stop_pct * 0.55, 0.012))
+        max_allowed_floor = max(max_allowed_floor, tighter_floor)
+
     new_stop = max(cur_stop, max_allowed_floor) if cur_stop else max_allowed_floor
 
     already_in_profit_stop = (cur_stop is not None and cur_stop >= entry) or scaled_out
@@ -722,6 +731,7 @@ def close_position_safe(tc, symbol, pos_symbol):
 def manage_position(tc, symbol, pos, m, is_crypto, pos_mem, flatten_now=False):
     pos_symbol = norm(symbol)
     entry = float(pos.avg_entry_price)
+    market_val = abs(float(getattr(pos, 'market_value', 20000.0) or 20000.0))
     live_price = float(pos.current_price) if getattr(pos, 'current_price', None) else m['price']
     m['price'] = live_price
     profit = live_price / entry - 1.0
@@ -732,11 +742,11 @@ def manage_position(tc, symbol, pos, m, is_crypto, pos_mem, flatten_now=False):
     init_stop_pct = effective_init_stop_pct(entry, cur_stop, stop_distance_pct(m))
     stage_tag = "50% Runner" if pos_mem.get('scaled_out') else "100%"
 
-    print(f"💼 [DEȚINUT {stage_tag}] {symbol:<8} | Live: {live_price:<10.4f} | P/L: {profit*100:+.2f}% "
-          f"| Stop: {cur_stop or 0:<9.4f} | ATR(5m): {m['atr_pct']*100:.2f}% | Social: {m['social']:+d}")
+    print(f"💼 [DEȚINUT {stage_tag}] {symbol:<8} | Val: {market_val:7.0f}$ | Live: {live_price:<10.4f} "
+          f"| P/L: {profit*100:+.2f}% | Stop: {cur_stop or 0:<9.4f} | Social: {m['social']:+d}")
 
     reason = "Închidere înainte de bell (fără risc overnight)" if flatten_now \
-        else exit_decision(profit, m, init_stop_pct, cost_rt)
+        else exit_decision(profit, m, init_stop_pct, cost_rt, market_val=market_val)
     if reason:
         print(f"   🔔 [IEȘIRE] {symbol}: {reason} ({profit*100:+.2f}%)")
         return close_position_safe(tc, symbol, pos_symbol)
@@ -850,7 +860,7 @@ def prepare_symbol_frames(bars_df, symbols, now, stale_bars, is_stock=False):
 
 
 # ==========================================
-# 8. CICLUL PRINCIPAL V8.2
+# 8. CICLUL PRINCIPAL V8.3
 # ==========================================
 def process_symbol(tc, symbol, pack, is_crypto, is_safe, held, ctx):
     ind, live_price, live_high = pack
@@ -880,7 +890,7 @@ def process_symbol(tc, symbol, pack, is_crypto, is_safe, held, ctx):
         return
     if ctx['risk_off'] and not is_safe:
         return
-    if not entry_allowed(m, round_trip_cost(is_crypto)):
+    if not entry_allowed(m, round_trip_cost(is_crypto), now_utc=ctx['now_utc']):
         return
 
     print(f"🟢 [SEMNAL {m['setup']}] {symbol:<8} | Live: {m['price']:.4f} | Scor: {m['score']} | {m['reason']}")
@@ -904,10 +914,11 @@ def open_new_positions(tc, ctx, held, equity):
         try:
             cash = float(tc.get_account().cash)
             invest = position_size_usd(equity, cash, gross, t['init_stop_pct'], t['score'])
-            if invest < 50.0:
+            # Nu irosim un slot pe poziții sub 4.000$ (cum a fost UNIUSD de 1.624$)
+            if invest < MIN_POSITION_USD:
                 continue
             sym, pos_sym = t['symbol'], t['pos_symbol']
-            print(f"🎯 [INTRARE V8.2] {sym}: ~{invest:.0f}$ | Stop: -{t['init_stop_pct']*100:.2f}% "
+            print(f"🎯 [INTRARE V8.3] {sym}: ~{invest:.0f}$ | Stop: -{t['init_stop_pct']*100:.2f}% "
                   f"| Scor {t['score']} ({t['reason']})")
             if t['is_crypto']:
                 tc.submit_order(MarketOrderRequest(
@@ -948,9 +959,11 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val, po
     entries_blocked = daily_pnl <= -DAILY_LOSS_LIMIT_PCT
 
     held = get_active_positions_and_sweep_dust(tc)
+    now = datetime.now(timezone.utc)
+    night_mode = is_low_liquidity_night(now)
 
-    print(f"\n⚡ Scanare V8.2 (5m+PriceAction): {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} | Equity: {equity:,.2f}$ "
-          f"| Poziții reale: {len(held)}/{DNA['max_positions']} | Kill-switch: {death_threshold:,.2f}$ | Azi: {daily_pnl*100:+.2f}%")
+    print(f"\n⚡ Scanare V8.3 ({'🌙 Filtru Noapte' if night_mode else '☀️ Zi'}): {now.strftime('%H:%M:%S UTC')} "
+          f"| Equity: {equity:,.2f}$ | Poziții reale: {len(held)}/{DNA['max_positions']} | Kill-switch: {death_threshold:,.2f}$ | Azi: {daily_pnl*100:+.2f}%")
     if entries_blocked:
         print(f"🧯 Limita zilnică de pierdere ({DAILY_LOSS_LIMIT_PCT*100:.0f}%) atinsă: doar gestionăm pozițiile.")
     if show_scorecard:
@@ -962,10 +975,9 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val, po
         time.sleep(1)
         tc.close_all_positions(cancel_orders=True)
         with open(DEATH_FILE, "w") as f:
-            f.write(f"Killed at {datetime.now(timezone.utc)} with equity {equity:.2f}$ (peak {peak:.2f}$)\n")
+            f.write(f"Killed at {now} with equity {equity:.2f}$ (peak {peak:.2f}$)\n")
         sys.exit(0)
 
-    now = datetime.now(timezone.utc)
     crypto_bars = crypto_client.get_crypto_bars(CryptoBarsRequest(
         symbol_or_symbols=ALL_CRYPTO, timeframe=bar_tf(), start=now - timedelta(days=2))).df
     crypto_packs = prepare_symbol_frames(crypto_bars, ALL_CRYPTO, now, stale_bars=6, is_stock=False)
@@ -986,7 +998,8 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val, po
     ctx = {
         'social': social_scores, 'risk_off': risk_off, 'entries_blocked': entries_blocked,
         'closed': set(), 'candidates': [], 'stock_entries_ok': False, 'flatten_stocks': False,
-        'pos_memory': pos_memory, 'cooldown_syms': cooldown_syms, 'btc_ret_2h': btc_ret_2h
+        'pos_memory': pos_memory, 'cooldown_syms': cooldown_syms, 'btc_ret_2h': btc_ret_2h,
+        'now_utc': now
     }
 
     for symbol, pack in crypto_packs.items():
@@ -1025,7 +1038,7 @@ def main():
     crypto_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
     stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-    print(f"🚀 AGENT V8.2 pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) | 5m + Live 30s + Candlesticks + Dust Filter | "
+    print(f"🚀 AGENT V8.3 pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) | 5m + Night Filter + Dynamic Stop | "
           f"cost round-trip crypto {round_trip_cost(True)*100:.2f}%")
     social_scores, fear_greed_val = scan_social_media_and_sentiment()
     pos_memory, cooldown_syms = build_position_memory_and_cooldowns(tc)
