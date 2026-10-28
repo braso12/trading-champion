@@ -1,28 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TRADING CHAMPION V9 — SMC & ICT INSTITUTIONAL EDITION
-Bazat pe manualul "Beyond The Markets" (OrientFX): Price Action + Smart Money Concepts + ICT
+TRADING CHAMPION V9.1 — SMC & ICT INSTITUTIONAL EDITION (FUSION COMPLETĂ)
+Bazat pe manualul "Beyond The Markets" (OrientFX) + Optimizări Live Alpaca
 
-Ce implementează V9 din carte:
-  1. LIQUIDITY SWEEP ("Turtle Soup" / Stop-Hunt - Pag. 85-90, 103, 249):
-     Intră DUPĂ ce prețul mătură Stop-Loss-urile sub un Swing Low (Sell-Side Liquidity) și
-     revine puternic în sus cu Market Structure Shift (MSS / CHoCH).
-  2. FAIR VALUE GAPS (FVG - Pag. 96-102, 206-211) & ORDER BLOCKS (OB - Pag. 80-83, 212):
-     Detectează golurile de lichiditate din 3 lumânări (low[i] > high[i-2]) și ultima lumânare
-     roșie înainte de Displacement (Order Block), cumpărând la retestarea zonei instituționale.
-  3. PREMIUM / DISCOUNT & FIBONACCI OTE / GOLDEN ZONE (Pag. 201, 224-229, 259-262):
-     Calculează intervalul Swing Low - Swing High (0..1) cu echilibrul la 0.5 (50%). Blochează
-     cumpărările scumpe în extremă Premium și favorizează intrările în Discount / OTE (50%-78.6%).
-  4. BREAK & RETEST + ENGULFING RULE NO. 1 (Pag. 33, 48-49, 68):
-     Nu urmărește lumânări uriașe extinse; așteaptă retestarea și interzice cumpărarea contra
-     unui Bearish Engulfing / Shooting Star / Gravestone Doji.
-  5. ICT KILLZONES & POWER OF THREE (A-M-D - Pag. 231-236, 245-251, 263-266):
-     Filtrează faza de Acumulare (sesiunea asiatică) și prioritizează ferestrele instituționale
-     London Killzone, New York Killzone și ICT Silver Bullet / Macros.
-  6. ANTI-LOSING-STREAK SIZING (Pag. 137) + SL TO BE & PARTIALS (Pag. 254, 273):
-     Reduce automat riscul cu 35% după pierderi consecutive (fără revenge trading), mută rapid
-     SL la Break-Even (SL to BE) și marchează profit parțial + Runner pe deviație standard.
+Ce implementează V9.1:
+  1. LIQUIDITY SWEEP ("Turtle Soup" / Stop-Hunt - Pag. 85-90, 103, 249) + MSS / CHoCH.
+  2. FAIR VALUE GAPS (FVG 50% Equilibrium - Pag. 96-102, 206-211) & ORDER BLOCKS (OB - Pag. 80-83).
+  3. PREMIUM / DISCOUNT & FIBONACCI OTE GOLDEN ZONE (50% - 78.6% - Pag. 201, 224-229, 259):
+     Cumpără în Discount/OTE și strânge automat Trailing Stop-ul când prețul ajunge în Premium (>70%).
+  4. ICT KILLZONES & SILVER BULLET (Pag. 231-236, 245-251, 263-266) + Filtru Asian Accumulation.
+  5. ORDINE LIMIT LA INTRARE + RECYCLER MICRO-POZIȚII (<3.500$, ex: UNIUSD) + SL TO BE RAPID.
 """
 import os
 import re
@@ -42,6 +30,7 @@ import pandas as pd
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
+    LimitOrderRequest,
     StopOrderRequest,
     StopLimitOrderRequest,
     GetOrdersRequest,
@@ -54,7 +43,7 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 
 # ==========================================
-# 1. CONFIGURARE V9 (SMC & ICT)
+# 1. CONFIGURARE V9.1 (SMC & ICT)
 # ==========================================
 API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
@@ -69,11 +58,12 @@ IGNORE_HISTORY_PEAK = os.environ.get("IGNORE_HISTORY_PEAK", "0") == "1"
 DEATH_FILE = "DEAD.lock"
 
 DUST_THRESHOLD_USD = 5.0      # Ignoră firimiturile crypto sub 5$ (AVAX, LTC, SOL dust)
-MIN_POSITION_USD = 4000.0     # Evită micro-pozițiile sub 4.000$ care blochează sloturile
+MICRO_POS_USD = 3500.0        # Eliberează slotul dacă o poziție e sub 3.500$ (ex: UNIUSD 1.624$) și stagnează
+MIN_POSITION_USD = 4500.0     # Nu deschide poziții noi sub 4.500$
 
-CRYPTO_FEE_PCT = float(os.environ.get("CRYPTO_FEE_PCT", "0.0025"))
-CRYPTO_SLIPPAGE_PCT = 0.0005
-STOCK_SLIPPAGE_PCT = 0.0003
+CRYPTO_FEE_PCT = float(os.environ.get("CRYPTO_FEE_PCT", "0.0022"))
+CRYPTO_SLIPPAGE_PCT = 0.0003
+STOCK_SLIPPAGE_PCT = 0.0002
 
 CRYPTO_SYMBOLS = [
     "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "XRP/USD",
@@ -95,13 +85,13 @@ DNA = {
     'ema_slow': 21,
     'ema_trend': 50,
     'atr_period': 14,
-    'min_confluences': 4,           # Pag. 67-68: Minim 3-5 confluențe pentru un setup de înaltă probabilitate!
-    'entry_score_min': 70,          # Scor minim în timpul Killzones (Londra / New York)
-    'asian_accumulation_score': 78, # Pag. 248: Sesiunea asiatică e Acumulare (range); cerem scor mult mai strict!
+    'min_confluences': 4,           # Pag. 67-68: Minim 4 confluențe pentru un setup instituțional!
+    'entry_score_min': 70,          # Scor minim în sesiunile active
+    'asian_accumulation_score': 78, # Pag. 248: Sesiunea asiatică e Acumulare (range); filtru strict!
 
-    'base_risk_per_trade': 0.005,   # 0.50% risc standard (Pag. 66, 138: niciodată peste 2%)
-    'high_conviction_risk': 0.007,  # 0.70% când avem >= 5 confluențe SMC + ICT Killzone
-    'losing_streak_factor': 0.65,   # Pag. 137: Reducem miza la 65% dacă venim după pierderi consecutive!
+    'base_risk_per_trade': 0.005,   # 0.50% risc standard
+    'high_conviction_risk': 0.007,  # 0.70% pe setup-uri SMC + ICT Killzone (scor >= 82)
+    'losing_streak_factor': 0.65,   # Pag. 137: Reducem miza la 65% după pierderi consecutive!
     'max_positions': 5,
     'max_crypto_positions': 4,
     'max_single_exposure': 0.22,
@@ -109,18 +99,18 @@ DNA = {
 
     'stop_atr_mult': 2.2,
     'min_stop_pct': 0.012,
-    'max_stop_pct': 0.025,
-    'legacy_cut_pct': -0.028,
-    'trail_atr_mult': 2.1,
-    'breakeven_trigger_r': 0.50,    # Pag. 273 (SL to BE): mutăm Stop-Loss la Break-Even rapid când intră în profit!
+    'max_stop_pct': 0.024,
+    'legacy_cut_pct': -0.026,
+    'trail_atr_mult': 2.0,          # Trailing normal (scade la 1.5x ATR când prețul intră în zona Premium!)
+    'breakeven_trigger_r': 0.45,    # Pag. 273 (SL to BE): mutăm Stop-Loss la Break-Even rapid!
 
-    'use_partial_tp': True,         # Pag. 254, 273 (Take Partials): securizăm profit parțial + lăsăm Runner!
+    'use_partial_tp': True,         # Pag. 254, 273 (Take Partials 50% + Runner)
     'partial_tp_r': 0.85,
-    'spike_harvest_pct': 0.020,     # La -2.5 / -4 Standard Deviation (Pag. 254) încasăm explozia!
+    'spike_harvest_pct': 0.020,
     'use_exhaustion_exit': True,
-    'exhaustion_min_r': 1.15,
+    'exhaustion_min_r': 1.10,
     'soft_stop_frac_news': 0.4,
-    'vol_cost_mult': 3.5,
+    'vol_cost_mult': 3.4,
     'reentry_cooldown_min': 30,
 }
 
@@ -173,17 +163,9 @@ def truncate_qty(q, is_crypto, decimals=8):
 
 
 def get_ict_session_info(now_utc):
-    """
-    Identifică sesiunea ICT (Pag. 231-236, 248, 263-265):
-    - London Open Killzone: 05:00 - 09:00 UTC (1 PM - 5 PM SGT)
-    - New York Killzone & Silver Bullet: 12:00 - 16:00 UTC (08:00 AM - 12:00 PM EST)
-    - NY PM Macro / Silver Bullet: 18:00 - 20:00 UTC (02:00 PM - 04:00 PM EST)
-    - Asian Accumulation (Consolidare): 00:00 - 05:00 UTC
-    """
     ny_time = now_utc.astimezone(NY_TZ).time()
     utc_t = now_utc.time()
 
-    # Ferestrele ICT Silver Bullet & Macros (Pag. 263, 265: 3-4 AM, 10-11 AM, 2-3 PM NY Time)
     is_silver_bullet = (
         (dtime(3, 0) <= ny_time <= dtime(4, 30)) or
         (dtime(9, 50) <= ny_time <= dtime(11, 15)) or
@@ -241,7 +223,7 @@ def filter_regular_stock_hours(df):
 
 
 # ==========================================
-# 3. RADAR SOCIAL MEDIA, ȘTIRI & FUNDAMENTALS (PAG. 151-195)
+# 3. RADAR SOCIAL MEDIA & ȘTIRI
 # ==========================================
 def fetch_url_raw(url, headers=None, timeout=7):
     try:
@@ -349,7 +331,7 @@ def scan_social_media_and_sentiment():
 
 
 # ==========================================
-# 4. MOTORUL SMC + ICT + PRICE ACTION (CAPITOLELE 2, 3, 6, 7 DIN CARTE)
+# 4. MOTORUL SMC + ICT + PRICE ACTION
 # ==========================================
 def compute_indicators(df):
     c = df['close'].astype(float)
@@ -364,17 +346,14 @@ def compute_indicators(df):
     ind['ema_slow'] = c.ewm(span=DNA['ema_slow'], adjust=False).mean()
     ind['ema_trend'] = c.ewm(span=DNA['ema_trend'], adjust=False).mean()
 
-    # Multi-Timeframe Analysis (Pag. 65, 68: M15, H1, H4 aliniate)
     ind['ema_1h_fast'] = c.ewm(span=108, adjust=False).mean()
     ind['ema_1h_slow'] = c.ewm(span=252, adjust=False).mean()
     ind['ret_2h'] = c.pct_change(24).fillna(0.0)
 
-    # VWAP Instituțional
     typ_price = (h + l + c) / 3.0
     vol_sum = v.rolling(48, min_periods=5).sum().replace(0, np.nan)
     ind['vwap'] = ((typ_price * v).rolling(48, min_periods=5).sum() / vol_sum).fillna(c)
 
-    # RSI & MACD
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
@@ -391,7 +370,6 @@ def compute_indicators(df):
     ind['macd_rising'] = hist >= hist.shift(1)
     ind['macd_losing'] = (hist < hist.shift(1)) & (hist.shift(1) < hist.shift(2))
 
-    # ATR & ADX
     prev_c = c.shift(1)
     tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1 / DNA['atr_period'], adjust=False).mean()
@@ -407,7 +385,6 @@ def compute_indicators(df):
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(15.0)
     ind['adx'] = dx.ewm(alpha=1 / 14, adjust=False).mean().fillna(15.0)
 
-    # Standard Deviation & Bollinger (Pag. 252-254: proiecție la 2 - 2.5 deviații standard)
     sma20 = c.rolling(20).mean()
     std20 = c.rolling(20).std()
     width = (4 * std20).replace(0, np.nan)
@@ -418,9 +395,7 @@ def compute_indicators(df):
     avg_vol = v.rolling(20).mean()
     ind['rvol'] = (v / avg_vol.replace(0, np.nan)).fillna(1.0)
 
-    # =========================================================================
-    # A. LUMÂNĂRI JAPONEZE & INSTITUTIONAL DISPLACEMENT (PAG. 31-40, 76, 219)
-    # =========================================================================
+    # A. LUMÂNĂRI JAPONEZE & INSTITUTIONAL DISPLACEMENT
     rng = (h - l).clip(lower=1e-12)
     body = (c - o).abs()
     body_top = pd.concat([c, o], axis=1).max(axis=1)
@@ -435,7 +410,6 @@ def compute_indicators(df):
     prev2_o, prev2_c = o.shift(2), c.shift(2)
     prev2_body = body.shift(2)
 
-    # Bullish/Bearish Hammers, Engulfing, Morning Star, Dragonfly & Gravestone Doji (Pag. 32-40)
     ind['bull_hammer'] = (lower_wick >= 0.50) & (upper_wick <= 0.22) & (bb_pos <= 0.60)
     ind['dragonfly_doji'] = (body_ratio <= 0.18) & (lower_wick >= 0.60) & (upper_wick <= 0.20)
     ind['bull_engulf'] = (prev_c < prev_o) & (c > o) & (c >= prev_o) & (o <= prev_c * 1.001) & (body >= prev_body * 1.05)
@@ -445,46 +419,32 @@ def compute_indicators(df):
     ind['shooting_star'] = (upper_wick >= 0.52) & (lower_wick <= 0.22) & (body_ratio <= 0.38) & (bb_pos >= 0.70)
     ind['gravestone_doji'] = (body_ratio <= 0.18) & (upper_wick >= 0.60) & (bb_pos >= 0.70)
     ind['bear_engulf'] = (prev_c > prev_o) & (c < o) & (c <= prev_o) & (body >= prev_body * 1.05) & (bb_pos >= 0.62)
-
-    # Displacement / Institutional Candle (Pag. 76, 219: corp lung >= 1.3x ATR, cozi mici)
     ind['bull_displacement'] = (c > o) & (body >= atr * 1.25) & (body_ratio >= 0.62)
 
-    # =========================================================================
     # B. SMART MONEY CONCEPTS: FVG, ORDER BLOCKS, LIQUIDITY SWEEP, PD ARRAYS
-    # =========================================================================
-    # 1. Dealing Range (36 bare = 3 ore): Swing High (1.0), Swing Low (0.0), Equilibrium (0.5) (Pag. 224-229, 259)
     swing_hi = h.rolling(36, min_periods=12).max()
     swing_lo = l.rolling(36, min_periods=12).min()
     deal_rng = (swing_hi - swing_lo).replace(0, np.nan)
-    # pd_pos: 0.0 = Swing Low (Discount maxim), 0.5 = Equilibrium, 1.0 = Swing High (Premium maxim)
     ind['pd_pos'] = ((c - swing_lo) / deal_rng).fillna(0.5)
-    # Fibonacci Retracement din Swing High spre Swing Low: OTE / Golden Zone = 0.50 .. 0.786 (Pag. 201, 243, 259)
     ind['fib_retrace'] = ((swing_hi - c) / deal_rng).fillna(0.5)
 
-    # 2. Structura Pieței: HH / HL / BOS & Sell-Side Liquidity (SSL) (Pag. 50-53, 92-95, 199)
     ind['hh12'] = h.shift(1).rolling(12).max()
-    ind['ssl_low12'] = l.shift(2).rolling(14).min()   # Nivelul unde stau Stop-Loss-urile cumpărătorilor (SSL)
+    ind['ssl_low12'] = l.shift(2).rolling(14).min()
     ind['low3'] = l.rolling(3).min()
 
-    # Liquidity Sweep ("Turtle Soup" - Pag. 88, 103, 249): fitilul a coborât sub SSL_low12 (a luat stop-urile),
-    # dar prețul a fost cumpărat agresiv de Market Makers și a închis înapoi deasupra SSL_low12!
     swept_recent = (l <= ind['ssl_low12'] * 1.0005) | (l.shift(1) <= ind['ssl_low12'].shift(1) * 1.0005)
     ind['liquidity_sweep'] = swept_recent & (c > ind['ssl_low12']) & (c > o)
 
-    # Break of Structure (BOS - Pag. 92-93) & Change of Character / MSS (Pag. 94-95, 216-217)
     ind['bos_up'] = (c > ind['hh12']) & (c > o)
     minor_lh = h.shift(1).rolling(5).max()
     ind['mss_choch'] = ind['liquidity_sweep'] & ((c > minor_lh) | ind['bull_engulf'] | ind['bull_displacement'])
 
-    # 3. Fair Value Gap (FVG Bullish - Pag. 98-99, 207): low[k] > high[k-2] cu lumânare de mijloc verde puternică
     fvg_created = (l > h.shift(2)) & (c.shift(1) > o.shift(1)) & (body.shift(1) >= atr.shift(1) * 0.7)
     fvg_bot_series = h.shift(2).where(fvg_created, np.nan).ffill(limit=18)
     fvg_top_series = l.where(fvg_created, np.nan).ffill(limit=18)
-    fvg_mid_series = (fvg_bot_series + fvg_top_series) / 2.0  # Pag. 101-102: 50% FVG Equilibrium
-    # Prețul retestează zona FVG (sau 50% din FVG) și rezistă deasupra bazei FVG
+    fvg_mid_series = (fvg_bot_series + fvg_top_series) / 2.0
     ind['fvg_retest'] = fvg_bot_series.notna() & (l <= fvg_top_series * 1.002) & (c >= fvg_mid_series * 0.998)
 
-    # 4. Bullish Order Block (OB - Pag. 80-82, 212-214): ultima lumânare roșie înainte de Displacement/BOS
     ob_created = (c.shift(1) < o.shift(1)) & (ind['bull_displacement'] | ind['bull_engulf'])
     ob_bot_series = l.shift(1).where(ob_created, np.nan).ffill(limit=24)
     ob_top_series = h.shift(1).where(ob_created, np.nan).ffill(limit=24)
@@ -514,7 +474,6 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
     fib_retrace = float(r['fib_retrace'])
     std_z = float(r['std_zscore'])
 
-    # Citim semnalele din lumânările japoneze & SMC/ICT
     is_hammer = bool(r['bull_hammer']) or bool(r['dragonfly_doji'])
     is_bull_engulf = bool(r['bull_engulf'])
     is_morning_star = bool(r['morning_star'])
@@ -535,19 +494,14 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
     elif is_hammer:
         candle_bull_name = "Hammer/Dragonfly"
 
-    # Aliniere Multi-Timeframe (Pag. 65: M5/M15 + H1 Trend Bias)
     trend_up = (ema_f >= ema_s * 0.999) and (ema_s >= ema_t * 0.998) and (price > ema_t)
     htf_1h_ok = (price >= ema_1h_f * 0.993) and (ema_1h_f >= ema_1h_s * 0.990)
     above_vwap = price >= vwap
     bullish_action = (price > bar_open) or (bar_close > bar_open)
 
-    # Discount & Fibonacci OTE / Golden Zone (Pag. 201, 224-227, 259: 50% - 78.6% retracement)
     in_discount = pd_pos <= 0.55
     in_ote_golden_zone = 0.45 <= fib_retrace <= 0.79
 
-    # =========================================================================
-    # DETECTOR PLAFON DE PROFIT + REGULA NR. 1 (PAG. 33: FĂRĂ CONTRA-ENGULFING)
-    # =========================================================================
     ceiling, why = False, ""
     if is_bear_engulf:
         ceiling, why = True, "Bearish Engulfing în vârf (Regula Nr. 1 Pag. 33)"
@@ -560,31 +514,25 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
     elif wick > 0.58 and bb > 0.78 and not macd_rising:
         ceiling, why = True, "Respingere din zona de Supply (Wick Rejection)"
 
-    # =========================================================================
-    # NUMĂRAREA CONFLUENȚELOR (PAG. 26, 67-68, 146: MINIM 4-5 CONFLUENȚE!)
-    # =========================================================================
     confluences = 0
     if htf_1h_ok:
-        confluences += 1  # Confluența 1: H1 Multi-Timeframe Bias
+        confluences += 1
     if trend_up or mss_choch:
-        confluences += 1  # Confluența 2: Market Structure (HH/HL sau MSS/CHoCH)
+        confluences += 1
     if in_discount or in_ote_golden_zone or above_vwap:
-        confluences += 1  # Confluența 3: Discount / OTE Golden Zone / VWAP
+        confluences += 1
     if fvg_retest or ob_retest or liq_sweep or bos_up:
-        confluences += 1  # Confluența 4: Element SMC (FVG / Order Block / Liquidity Sweep / BOS)
+        confluences += 1
     if candle_bull_name or (bullish_action and macd_rising):
-        confluences += 1  # Confluența 5: Confirmare Lumânare Japoneză / Momentum
+        confluences += 1
     if rvol >= 1.10 or adx >= 19:
-        confluences += 1  # Confluența 6: Volum / Putere Trend
+        confluences += 1
 
     score, setup, reasons = 0, None, []
 
-    # SETUP 1: SMC LIQUIDITY SWEEP + MSS / CHoCH ("Turtle Soup" - Pag. 88, 103, 216, 249)
     if (liq_sweep or mss_choch) and htf_1h_ok and bullish_action and macd_rising:
         score, setup = 78, 'LIQUIDITY_SWEEP'
         reasons.append("SMC Liquidity Sweep (Stop-Hunt) + MSS")
-
-    # SETUP 2: ICT OTE GOLDEN ZONE + ORDER BLOCK / FVG RETEST (Pag. 82, 101-102, 201, 259)
     elif (fvg_retest or ob_retest) and htf_1h_ok and bullish_action and macd_rising and 38 <= rsi <= 68:
         score, setup = 76, 'SMC_OB_FVG'
         zone_tag = "OrderBlock+FVG" if (fvg_retest and ob_retest) else ("FVG 50%" if fvg_retest else "OrderBlock")
@@ -592,21 +540,15 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
             score += 4
             zone_tag += "+OTE(61.8%)"
         reasons.append(f"Retest {zone_tag}")
-
-    # SETUP 3: BREAK OF STRUCTURE (BOS) & RETEST (Pag. 48-49, 68, 92-93: fără lumânări extinse în extremă!)
     elif trend_up and htf_1h_ok and above_vwap and macd_rising and 48 <= rsi <= 72 \
             and (bos_up or price > hh12) and pd_pos <= 0.90 and (rvol >= 1.15 or adx >= 20):
         score, setup = 74, 'BOS_BREAKOUT'
         reasons.append(f"BOS Structure+VWAP(Vol {rvol:.1f}x)")
-
-    # SETUP 4: DISCOUNT PULLBACK ÎN TREND (Pag. 50, 226-227: Higher Low în Discount / Golden Zone)
     elif trend_up and htf_1h_ok and bullish_action and macd_rising and 40 <= rsi <= 62 \
             and (in_discount or in_ote_golden_zone or float(r['low3']) <= max(ema_s, vwap) * 1.003) \
             and price > ema_f and bb < 0.80:
         score, setup = 72, 'OTE_PULLBACK'
         reasons.append("Pullback în Discount/OTE")
-
-    # SETUP 5: PRICE ACTION CANDLESTICK REVERSAL LA SUPORT (Pag. 32-35, 64)
     elif candle_bull_name and htf_1h_ok and in_discount and price > ema_f and macd_rising and rvol >= 1.05:
         score, setup = 71, 'PRICE_ACTION'
         reasons.append(f"🕯️ {candle_bull_name} în Discount")
@@ -653,7 +595,6 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
 
 def entry_allowed(m, cost_rt, is_asian_accum=False):
     min_req = DNA['asian_accumulation_score'] if is_asian_accum else DNA['entry_score_min']
-    # Pag. 67-68, 146: Nu intrăm fără minim 4 confluențe aliniate!
     if not m['setup'] or m['confluences'] < DNA['min_confluences'] or m['score'] < min_req or m['profit_ceiling_hit']:
         return False
     return m['atr_pct'] * DNA['vol_cost_mult'] >= cost_rt
@@ -662,27 +603,32 @@ def entry_allowed(m, cost_rt, is_asian_accum=False):
 def exit_decision(profit, m, init_stop_pct, cost_rt, market_val=20000.0):
     trend_broken = m['ema_fast'] < m['ema_slow'] and not m['macd_rising'] and m['price'] < m['vwap']
 
-    if market_val < 3500.0 and profit > -0.008 and trend_broken:
-        return f"Eliberare slot ocupat de micro-poziție ({market_val:.0f}$)"
+    # 1. RECYCLER MICRO-POZIȚII: eliberează slotul dacă o poziție e sub 3.500$ (ex: UNIUSD 1.624$) și nu are setup SMC
+    if market_val < MICRO_POS_USD and profit > -0.010 and m['score'] < 70:
+        return f"Reciclare slot micro-poziție ({market_val:.0f}$) pentru alocare completă"
 
+    # 2. Țintă Distribuție / Spike Harvester
     if profit >= DNA['spike_harvest_pct'] and (m['rsi'] > 73 or m['profit_ceiling_hit']):
         return f"Țintă Distribuție / Spike încasat (+{profit*100:.2f}%)"
 
+    # 3. CHoCH Bearish pe poziții vechi
     if profit <= DNA['legacy_cut_pct'] and trend_broken:
         return f"CHoCH Bearish sub {DNA['legacy_cut_pct']*100:.1f}% (structură + VWAP pierdute)"
 
+    # 4. Plafon SMC / Price Action
     if DNA['use_exhaustion_exit']:
         min_net = cost_rt + (init_stop_pct * DNA['exhaustion_min_r'])
         if profit >= min_net and m['profit_ceiling_hit']:
             return f"Plafon SMC/PriceAction la >{DNA['exhaustion_min_r']}R: {m['ceiling_reason']}"
 
+    # 5. Stop la știri negative
     if m['social'] <= -5 and trend_broken and profit <= -init_stop_pct * DNA['soft_stop_frac_news']:
         return "Stop controlat: structură ruptă + știri negative"
     return None
 
 
 # ==========================================
-# 5. EXECUȚIE, SL TO BE, PARTIALS & ANTI-LOSING-STREAK
+# 5. EXECUȚIE V9.1: LIMIT ENTRY, SL TO BE, PARTIALS & PREMIUM TRAIL
 # ==========================================
 def get_open_orders(tc):
     try:
@@ -693,10 +639,6 @@ def get_open_orders(tc):
 
 
 def build_position_memory_and_cooldowns(tc):
-    """
-    Reconstruiește memoria pozițiilor, Cooldown-ul pe simbol și detectează dacă portofoliul
-    vine după o serie de pierderi (Pag. 137: reducem riscul în timpul unui losing streak).
-    """
     mem = {}
     cooldown_syms = set()
     portfolio_loss_streak = 0
@@ -768,6 +710,45 @@ def place_stop(tc, symbol, qty, stop_price, is_crypto):
     return stop_price
 
 
+def submit_smart_buy(tc, symbol, invest_usd, live_price, is_crypto):
+    """Plasează ordin LIMIT la intrarea în FVG/OB pentru a evita slippage-ul, cu fallback rapid."""
+    limit_px = round_price(live_price * 1.0006, is_crypto)
+    qty = truncate_qty(invest_usd / limit_px, is_crypto, decimals=6)
+    if qty <= 0:
+        return False
+
+    tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
+    order = tc.submit_order(LimitOrderRequest(
+        symbol=symbol, qty=qty, limit_price=limit_px, side=OrderSide.BUY, time_in_force=tif
+    ))
+    time.sleep(3.5)
+    try:
+        updated = tc.get_order_by_id(order.id)
+        filled_q = float(getattr(updated, 'filled_qty', 0.0) or 0.0)
+        status_str = str(getattr(updated, 'status', '')).lower()
+        if 'filled' in status_str and filled_q >= qty * 0.95:
+            return True
+        tc.cancel_order_by_id(order.id)
+        time.sleep(1.0)
+        if filled_q * live_price >= MIN_POSITION_USD * 0.5:
+            return True
+        rem_usd = invest_usd - (filled_q * live_price)
+        if rem_usd >= 500.0:
+            if is_crypto:
+                tc.submit_order(MarketOrderRequest(
+                    symbol=symbol, notional=round(rem_usd, 2), side=OrderSide.BUY, time_in_force=TimeInForce.GTC))
+            else:
+                rem_qty = int(rem_usd // live_price)
+                if rem_qty >= 1:
+                    tc.submit_order(MarketOrderRequest(
+                        symbol=symbol, qty=rem_qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+            time.sleep(2.0)
+            return True
+    except Exception:
+        return True
+    return False
+
+
 def effective_init_stop_pct(entry, cur_stop, fallback_stop_pct):
     if cur_stop is not None and 0 < cur_stop < entry:
         return clamp((entry - cur_stop) / entry, DNA['min_stop_pct'], DNA['max_stop_pct'])
@@ -821,26 +802,28 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
             pos_mem['scaled_out'] = True
             return lock_stop
 
-    # 2. Strângere inteligentă a Stop-ului când poziția e pe plus (protejează PAXGUSD și SPY)
+    # 2. FAST FLOOR SHIELD: dacă o poziție e deja pe plus (>= +0.30%, ex: PAXGUSD și SPY),
+    # ridicăm imediat stop-ul la cel mult -0.60% sub intrare!
     max_allowed_floor = min(entry * (1.0 - init_stop_pct), live_price * (1.0 - init_stop_pct))
-    if profit >= 0.003:
-        tighter_floor = entry * (1.0 - min(init_stop_pct * 0.50, 0.011))
+    if profit >= 0.0030:
+        tighter_floor = entry * (1.0 - 0.0060)
         max_allowed_floor = max(max_allowed_floor, tighter_floor)
 
     new_stop = max(cur_stop, max_allowed_floor) if cur_stop else max_allowed_floor
 
-    # 3. SL to BE (Pag. 273: mutăm Stop-Loss pe Break-Even + comisioane când atinge +0.50R)
+    # 3. SL to BE & Trailing Stop adaptiv (mai strâns dacă prețul a ajuns în Extreme Premium > 70%)
     already_in_profit_stop = (cur_stop is not None and cur_stop >= entry) or scaled_out
     if profit >= init_stop_pct * DNA['breakeven_trigger_r'] or already_in_profit_stop:
         peak_val = max(live_price, m['peak_since_entry'])
-        trail = peak_val - DNA['trail_atr_mult'] * m['atr']
+        eff_trail_mult = DNA['trail_atr_mult'] * (0.75 if m['pd_pos'] >= 0.70 else 1.0)
+        trail = peak_val - eff_trail_mult * m['atr']
         new_stop = max(new_stop, trail, entry * (1.0 + cost_rt))
 
     new_stop = min(new_stop, live_price * 0.994)
 
     if cur_stop is not None:
         new_stop = max(new_stop, cur_stop)
-        if new_stop <= cur_stop * 1.0025:
+        if new_stop <= cur_stop * 1.0020:
             return cur_stop
         tc.cancel_order_by_id(cur.id)
         time.sleep(1.5)
@@ -848,7 +831,7 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
             fresh_pos = tc.get_open_position(pos_symbol)
             q_to_stop = float(getattr(fresh_pos, 'qty_available', None) or fresh_pos.qty)
             placed = place_stop(tc, symbol, q_to_stop, new_stop, is_crypto)
-            print(f"   🛡️ [SL ACTUALIZAT] {symbol}: {cur_stop:.4f} -> {placed}")
+            print(f"   🛡️ [SL ACTUALIZAT V9.1] {symbol}: {cur_stop:.4f} -> {placed}")
             return placed
         except Exception as e:
             print(f"   ⚠️ Stop nou respins ({e}); refac stop-ul anterior")
@@ -897,7 +880,7 @@ def manage_position(tc, symbol, pos, m, is_crypto, pos_mem, flatten_now=False):
     reason = "Închidere înainte de bell (fără risc overnight)" if flatten_now \
         else exit_decision(profit, m, init_stop_pct, cost_rt, market_val=market_val)
     if reason:
-        print(f"   🔔 [IEȘIRE] {symbol}: {reason} ({profit*100:+.2f}%)")
+        print(f"   🔔 [IEȘIRE V9.1] {symbol}: {reason} ({profit*100:+.2f}%)")
         return close_position_safe(tc, symbol, pos_symbol)
 
     try:
@@ -909,7 +892,6 @@ def manage_position(tc, symbol, pos, m, is_crypto, pos_mem, flatten_now=False):
 
 def position_size_usd(equity, cash, gross, init_stop_pct, score, loss_streak=0):
     risk_pct = DNA['high_conviction_risk'] if score >= 82 else DNA['base_risk_per_trade']
-    # Pag. 137: Reducem dimensiunea poziției dacă avem >= 2 pierderi la rând pe portofoliu!
     if loss_streak >= 2:
         risk_pct *= DNA['losing_streak_factor']
     by_risk = equity * risk_pct / init_stop_pct
@@ -1012,7 +994,7 @@ def prepare_symbol_frames(bars_df, symbols, now, stale_bars, is_stock=False):
 
 
 # ==========================================
-# 8. CICLUL PRINCIPAL V9 (SMC & ICT)
+# 8. CICLUL PRINCIPAL V9.1 (SMC & ICT)
 # ==========================================
 def process_symbol(tc, symbol, pack, is_crypto, is_safe, held, ctx):
     ind, live_price, live_high = pack
@@ -1026,7 +1008,6 @@ def process_symbol(tc, symbol, pack, is_crypto, is_safe, held, ctx):
         btc_ret_2h=btc_ret, entry_time=pos_mem.get('entry_time'),
         kz_bonus=ctx['kz_bonus']
     )
-    # Pag. 188-195: Aurul (PAXG / GLD) și TLT ca refugiu în timp de incertitudine/recesiune
     if is_safe and ctx['risk_off'] and m['setup']:
         m['score'] += 15
         m['reason'] += " + 🛡️ Safe-Haven Gold/Bonds (Pag. 188)"
@@ -1071,22 +1052,17 @@ def open_new_positions(tc, ctx, held, equity):
             if invest < MIN_POSITION_USD:
                 continue
             sym, pos_sym = t['symbol'], t['pos_symbol']
-            print(f"🎯 [INTRARE V9 SMC/ICT] {sym}: ~{invest:.0f}$ | Stop: -{t['init_stop_pct']*100:.2f}% "
+            print(f"🎯 [INTRARE V9.1 SMC/ICT] {sym}: ~{invest:.0f}$ | Stop: -{t['init_stop_pct']*100:.2f}% "
                   f"| Scor {t['score']} ({t['reason']})")
-            if t['is_crypto']:
-                tc.submit_order(MarketOrderRequest(
-                    symbol=sym, notional=round(invest, 2), side=OrderSide.BUY, time_in_force=TimeInForce.GTC))
-            else:
-                qty = int(invest // t['price'])
-                if qty < 1:
-                    continue
-                tc.submit_order(MarketOrderRequest(
-                    symbol=sym, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY))
+
+            if not submit_smart_buy(tc, sym, invest, t['price'], t['is_crypto']):
+                continue
+
             n_open += 1
             crypto_open += 1 if t['is_crypto'] else 0
             gross += invest
             ctx['pos_memory'][pos_sym] = {'entry_time': datetime.now(timezone.utc), 'scaled_out': False}
-            time.sleep(2.5)
+            time.sleep(1.5)
             try:
                 pos = tc.get_open_position(pos_sym)
                 q_avail = float(getattr(pos, 'qty_available', None) or pos.qty)
@@ -1115,7 +1091,7 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val, po
     now = datetime.now(timezone.utc)
     kz_name, kz_bonus, is_asian_accum = get_ict_session_info(now)
 
-    print(f"\n⚡ Scanare V9 ({kz_name}): {now.strftime('%H:%M:%S UTC')} "
+    print(f"\n⚡ Scanare V9.1 ({kz_name}): {now.strftime('%H:%M:%S UTC')} "
           f"| Equity: {equity:,.2f}$ | Poziții reale: {len(held)}/{DNA['max_positions']} | Kill-switch: {death_threshold:,.2f}$ | Azi: {daily_pnl*100:+.2f}%")
     if entries_blocked:
         print(f"🧯 Limita zilnică de pierdere ({DAILY_LOSS_LIMIT_PCT*100:.0f}%) atinsă: doar gestionăm pozițiile.")
@@ -1191,7 +1167,7 @@ def main():
     crypto_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
     stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-    print(f"🚀 AGENT V9 SMC & ICT pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) | Liquidity Sweep + FVG + OB + OTE + Killzones | "
+    print(f"🚀 AGENT V9.1 SMC & ICT pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) | Liquidity Sweep + FVG + OB + Limit Entry | "
           f"cost round-trip crypto {round_trip_cost(True)*100:.2f}%")
     social_scores, fear_greed_val = scan_social_media_and_sentiment()
     pos_memory, cooldown_syms, loss_streak = build_position_memory_and_cooldowns(tc)
