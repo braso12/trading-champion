@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TRADING CHAMPION V9.1 — SMC & ICT INSTITUTIONAL EDITION (FUSION COMPLETĂ)
-Bazat pe manualul "Beyond The Markets" (OrientFX) + Optimizări Live Alpaca
+TRADING CHAMPION V10.2 — PHOENIX (fix-uri de logică + învățare reală)
 
-Ce implementează V9.1:
-  1. LIQUIDITY SWEEP ("Turtle Soup" / Stop-Hunt - Pag. 85-90, 103, 249) + MSS / CHoCH.
-  2. FAIR VALUE GAPS (FVG 50% Equilibrium - Pag. 96-102, 206-211) & ORDER BLOCKS (OB - Pag. 80-83).
-  3. PREMIUM / DISCOUNT & FIBONACCI OTE GOLDEN ZONE (50% - 78.6% - Pag. 201, 224-229, 259):
-     Cumpără în Discount/OTE și strânge automat Trailing Stop-ul când prețul ajunge în Premium (>70%).
-  4. ICT KILLZONES & SILVER BULLET (Pag. 231-236, 245-251, 263-266) + Filtru Asian Accumulation.
-  5. ORDINE LIMIT LA INTRARE + RECYCLER MICRO-POZIȚII (<3.500$, ex: UNIUSD) + SL TO BE RAPID.
+Ce a fost reparat față de V10.1:
+  1. STAREA SE PIERDEA LA FIECARE RULARE: LEARNED_MEMORY.json se salva doar la rebirth, deci pe GitHub Actions
+     vârful de equity ("peak") și generația reveneau la zero la fiecare rulare -> pragul de -20% nu putea
+     ajunge niciodată. Acum: fișierul se commit-uiește la prima rulare și când peak-ul urcă cu >=0.5%.
+  2. FVG / ORDER BLOCK "RETEST" SE ACTIVA PE ACEEAȘI LUMÂNARE CU IMPULSUL: botul cumpăra chiar vârful
+     lumânării de displacement. Acum zonele sunt valabile doar de la lumânarea URMĂTOARE.
+  3. RUNNER-UL DE 50% ERA ÎNCHIS IMEDIAT după take-partial (regula "micro-poziție < 3500$"). Reparat.
+  4. STOP-ul era strâns la -0.8% de la intrare imediat ce profitul trecea de +0.8% (zgomot de 15m = scos pe stop).
+     Acum se strânge la jumătate din risc abia la +0.5R.
+  5. CHASE GUARD: semnalul se calculează pe lumânarea închisă, dar intrarea putea veni la 15 minute după,
+     mult peste preț. Acum nu se intră dacă prețul live > închidere semnal + 0.5 ATR.
+  6. ÎNVĂȚARE REALĂ: fiecare intrare poartă setup-ul în client_order_id (TC-<SETUP>-<id>); la fiecare rulare
+     se calculează expectanța pe setup (ultimele 7 zile, net de comisioane) și setup-urile cu profit factor < 0.85
+     (min. 8 tranzacții) sunt dezactivate automat până când pierderile îmbătrânesc.
+  7. BAN-URILE EXPIRĂ (72h) și se bazează pe date recente - înainte puteau bloca monedele definitiv.
+  8. P/L-ul din statistici include acum comisionul crypto (0.25% / parte), nu doar diferența de preț.
+  9. LIQUIDITY_SWEEP nu mai cumpără sub EMA50 (cuțit care cade); crypto cere +3 scor (comisioane mari);
+     NVDA+AMD nu se țin simultan.
+
+Regula ta rămâne: la -20% din banii băgați în poziții -> moare, învață, interzice vinovații, repornește singur.
 """
 import os
 import re
 import sys
 import time
 import json
+import uuid
+import subprocess
 import argparse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -34,7 +48,6 @@ from alpaca.trading.requests import (
     StopOrderRequest,
     StopLimitOrderRequest,
     GetOrdersRequest,
-    GetPortfolioHistoryRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
@@ -43,75 +56,90 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.data.enums import DataFeed
 
 # ==========================================
-# 1. CONFIGURARE V9.1 (SMC & ICT)
+# 1. CONFIGURARE V10.2
 # ==========================================
 API_KEY = os.environ.get("ALPACA_API_KEY")
 SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 PAPER = os.environ.get("ALPACA_PAPER", "true").lower() != "false"
 STARTING_CAPITAL = float(os.environ.get("STARTING_CAPITAL", "100000.0"))
 
-MAX_DRAWDOWN_PCT = float(os.environ.get("MAX_DRAWDOWN_PCT", "0.20"))          # Kill-switch la -20% (80,000$)
-DAILY_LOSS_LIMIT_PCT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.03"))  # Pauză la -3% într-o zi
+INVESTED_MAX_LOSS_PCT = float(os.environ.get("INVESTED_MAX_LOSS_PCT", "0.20"))  # Moare și învață la -20% din banii băgați în poziții
+DAILY_LOSS_LIMIT_PCT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.025"))   # Pauză la -2.5% pe zi
+AUTO_REBIRTH = os.environ.get("AUTO_REBIRTH", "true").lower() != "false"
+
 CYCLES_PER_RUN = int(os.environ.get("CYCLES_PER_RUN", "8"))
 CYCLE_SLEEP_SEC = int(os.environ.get("CYCLE_SLEEP_SEC", "30"))
-IGNORE_HISTORY_PEAK = os.environ.get("IGNORE_HISTORY_PEAK", "0") == "1"
-DEATH_FILE = "DEAD.lock"
 
-DUST_THRESHOLD_USD = 5.0      # Ignoră firimiturile crypto sub 5$ (AVAX, LTC, SOL dust)
-MICRO_POS_USD = 3500.0        # Eliberează slotul dacă o poziție e sub 3.500$ (ex: UNIUSD 1.624$) și stagnează
-MIN_POSITION_USD = 4500.0     # Nu deschide poziții noi sub 4.500$
+MEMORY_FILE = "LEARNED_MEMORY.json"
+DUST_THRESHOLD_USD = 5.0
+MICRO_POS_USD = 3500.0
+MIN_POSITION_USD = 5000.0
 
-CRYPTO_FEE_PCT = float(os.environ.get("CRYPTO_FEE_PCT", "0.0022"))
+BLACKLIST_HOURS = 72          # cât durează un ban după rebirth
+SETUP_WINDOW_DAYS = 7         # fereastra pentru statistica pe setup
+SETUP_MIN_TRADES = 8          # minim de tranzacții înainte să dezactivăm un setup
+SETUP_MIN_PF = 0.85           # profit factor sub care un setup e dezactivat
+PEAK_PERSIST_STEP = 0.005     # commit pe GitHub când peak-ul urcă cu >= 0.5%
+
+# Alpaca crypto Tier 1: taker 0.25%, maker 0.15% (scade la 0.22% taker peste 100k$ volum / 30 zile)
+CRYPTO_FEE_PCT = float(os.environ.get("CRYPTO_FEE_PCT", "0.0025"))
 CRYPTO_SLIPPAGE_PCT = 0.0003
 STOCK_SLIPPAGE_PCT = 0.0002
 
-CRYPTO_SYMBOLS = [
-    "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "XRP/USD",
-    "AVAX/USD", "LINK/USD", "LTC/USD", "UNI/USD", "NEAR/USD"
-]
-STOCK_SYMBOLS = ["NVDA", "TSLA", "AAPL", "AMD", "META", "SPY", "QQQ"]
+CRYPTO_SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "LINK/USD", "AVAX/USD", "LTC/USD", "UNI/USD"]
+STOCK_SYMBOLS = ["SPY", "QQQ", "NVDA", "TSLA", "AAPL", "AMD", "META"]
 SAFE_HAVEN_STOCKS = ["GLD", "TLT"]
 SAFE_HAVEN_CRYPTO = ["PAXG/USD"]
 ALL_CRYPTO = CRYPTO_SYMBOLS + SAFE_HAVEN_CRYPTO
 ALL_STOCKS = STOCK_SYMBOLS + SAFE_HAVEN_STOCKS
 
-FLATTEN_STOCKS_BEFORE_CLOSE = True
+# Grupuri corelate: nu cumpărăm niciodată două active din același grup simultan
+CORRELATED_GROUPS = [
+    {"GLD", "PAXGUSD"},
+    {"SPY", "QQQ"},
+    {"NVDA", "AMD"},
+]
+
+FLATTEN_STOCKS_BEFORE_CLOSE = False
 FLATTEN_MIN = 10
 NY_TZ = ZoneInfo("America/New_York")
 
 DNA = {
-    'bar_minutes': 5,
+    'bar_minutes': 15,
     'ema_fast': 9,
     'ema_slow': 21,
     'ema_trend': 50,
     'atr_period': 14,
-    'min_confluences': 4,           # Pag. 67-68: Minim 4 confluențe pentru un setup instituțional!
-    'entry_score_min': 70,          # Scor minim în sesiunile active
-    'asian_accumulation_score': 78, # Pag. 248: Sesiunea asiatică e Acumulare (range); filtru strict!
+    'min_confluences': 4,
+    'entry_score_min': 73,
+    'asian_accumulation_score': 82,
+    'crypto_score_premium': 3,     # crypto plătește ~0.5% comision round-trip -> cere semnal mai bun
+    'chase_atr_mult': 0.5,         # nu intrăm dacă prețul live e > închidere semnal + 0.5 ATR
 
-    'base_risk_per_trade': 0.005,   # 0.50% risc standard
-    'high_conviction_risk': 0.007,  # 0.70% pe setup-uri SMC + ICT Killzone (scor >= 82)
-    'losing_streak_factor': 0.65,   # Pag. 137: Reducem miza la 65% după pierderi consecutive!
-    'max_positions': 5,
-    'max_crypto_positions': 4,
+    'base_risk_per_trade': 0.005,
+    'high_conviction_risk': 0.0075,
+    'losing_streak_factor': 0.60,
+    'max_positions': 4,
+    'max_crypto_positions': 2,
     'max_single_exposure': 0.22,
-    'max_total_exposure': 0.85,
+    'max_total_exposure': 0.78,
 
-    'stop_atr_mult': 2.2,
-    'min_stop_pct': 0.012,
-    'max_stop_pct': 0.024,
-    'legacy_cut_pct': -0.026,
-    'trail_atr_mult': 2.0,          # Trailing normal (scade la 1.5x ATR când prețul intră în zona Premium!)
-    'breakeven_trigger_r': 0.45,    # Pag. 273 (SL to BE): mutăm Stop-Loss la Break-Even rapid!
+    'stop_atr_mult': 2.5,
+    'min_stop_pct': 0.018,
+    'max_stop_pct': 0.030,
+    'legacy_cut_pct': -0.030,
+    'trail_atr_mult': 2.4,
+    'breakeven_trigger_r': 0.85,
+    'half_risk_trigger_r': 0.5,    # la +0.5R mutăm stop-ul la jumătate din risc (înainte: -0.8% fix la +0.8%)
 
-    'use_partial_tp': True,         # Pag. 254, 273 (Take Partials 50% + Runner)
-    'partial_tp_r': 0.85,
-    'spike_harvest_pct': 0.020,
+    'use_partial_tp': True,
+    'partial_tp_r': 1.35,
+    'spike_harvest_pct': 0.032,
     'use_exhaustion_exit': True,
-    'exhaustion_min_r': 1.10,
-    'soft_stop_frac_news': 0.4,
-    'vol_cost_mult': 3.4,
-    'reentry_cooldown_min': 30,
+    'exhaustion_min_r': 1.80,
+    'soft_stop_frac_news': 0.5,
+    'vol_cost_mult': 3.8,
+    'reentry_cooldown_min': 60,
 }
 
 BULLISH_WORDS = ['surge', 'soar', 'bull', 'bullish', 'breakout', 'moon', 'rally', 'pump', 'ath',
@@ -122,9 +150,8 @@ BULL_RE = re.compile(r"\b(" + "|".join(BULLISH_WORDS) + r")\b")
 BEAR_RE = re.compile(r"\b(" + "|".join(BEARISH_WORDS) + r")\b")
 ALIASES = {
     'BTC': ['btc', 'bitcoin'], 'ETH': ['eth', 'ethereum'], 'SOL': ['solana', 'sol'],
-    'DOGE': ['doge', 'dogecoin'], 'XRP': ['xrp', 'ripple'], 'AVAX': ['avax', 'avalanche'],
-    'LINK': ['chainlink'], 'LTC': ['ltc', 'litecoin'], 'UNI': ['uniswap', 'uni'],
-    'NEAR': ['near'], 'PAXG': ['paxg', 'gold'],
+    'XRP': ['xrp', 'ripple'], 'AVAX': ['avax', 'avalanche'], 'LINK': ['chainlink'],
+    'LTC': ['ltc', 'litecoin'], 'UNI': ['uniswap', 'uni'], 'PAXG': ['paxg', 'gold'],
     'NVDA': ['nvda', 'nvidia'], 'TSLA': ['tsla', 'tesla'], 'AAPL': ['aapl', 'apple'],
     'AMD': ['amd'], 'META': ['meta'], 'SPY': ['spy'], 'QQQ': ['qqq', 'nasdaq'],
     'GLD': ['gld'], 'TLT': ['tlt'],
@@ -132,10 +159,13 @@ ALIASES = {
 
 
 # ==========================================
-# 2. UTILITARE & ICT KILLZONES (PAG. 231-236, 263-265)
+# 2. MEMORIE PERSISTENTĂ, ÎNVĂȚARE & REPORNIRE AUTOMATĂ (PHOENIX)
 # ==========================================
 def norm(sym):
     return sym.replace("/", "")
+
+
+CRYPTO_NORM = {norm(s) for s in ALL_CRYPTO}
 
 
 def clamp(x, lo, hi):
@@ -160,6 +190,318 @@ def truncate_qty(q, is_crypto, decimals=8):
     quant = Decimal("1." + "0" * decimals) if decimals > 0 else Decimal("1")
     d = Decimal(str(q)).quantize(quant, rounding=ROUND_DOWN)
     return float(d) if d > 0 else 0.0
+
+
+def net_trade_pnl(sym, avg_entry, exit_px, qty):
+    """P/L în $ net de comision (crypto plătește CRYPTO_FEE_PCT la intrare ȘI la ieșire)."""
+    pnl = (exit_px - avg_entry) * qty
+    if sym in CRYPTO_NORM:
+        pnl -= CRYPTO_FEE_PCT * (avg_entry + exit_px) * qty
+    return pnl
+
+
+def parse_setup_tag(client_order_id):
+    """client_order_id = 'TC-<SETUP>-<uuid>' -> '<SETUP>' (altfel None)."""
+    cid = str(client_order_id or "")
+    if cid.startswith("TC-"):
+        parts = cid.split("-")
+        if len(parts) >= 3 and parts[1]:
+            return parts[1]
+    return None
+
+
+def active_blacklist(learned_mem, now=None):
+    """Returnează setul de simboluri banate ACUM și curăță ban-urile expirate."""
+    now = now or datetime.now(timezone.utc)
+    active, keep = set(), {}
+    for sym, until in (learned_mem.get("blacklist_until") or {}).items():
+        try:
+            dt = datetime.fromisoformat(str(until))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if dt > now:
+            active.add(sym)
+            keep[sym] = until
+    learned_mem["blacklist_until"] = keep
+    return active
+
+
+def add_to_blacklist(learned_mem, syms, hours=BLACKLIST_HOURS):
+    until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    bl = learned_mem.setdefault("blacklist_until", {})
+    for s in syms:
+        bl[s] = until
+
+
+def load_learned_memory(current_equity):
+    """Încarcă memoria din LEARNED_MEMORY.json și inițializează baza Generației curente."""
+    default_mem = {
+        "generation": 1,
+        "generation_start_equity": round(current_equity, 2),   # = vârful de equity al generației (trailing peak)
+        "avg_invested_capital": 60000.0,
+        "blacklist_until": {},
+        "disabled_setups": [],
+        "preferred_symbols": ["SPY", "QQQ", "GLD", "PAXGUSD", "BTCUSD", "NVDA"],
+        "score_boost_req": 0,
+        "min_stop_override": DNA['min_stop_pct'],
+        "partial_tp_r_override": DNA['partial_tp_r'],
+        "lessons_learned": [],
+        "autopsy_history": []
+    }
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                default_mem.update(saved)
+        except Exception:
+            pass
+    else:
+        save_memory_file(default_mem)
+
+    # Migrare din V10.1: lista veche de ban-uri permanente -> ban-uri cu expirare
+    old_list = default_mem.pop("blacklisted_symbols", None)
+    if old_list and not default_mem.get("blacklist_until"):
+        add_to_blacklist(default_mem, old_list)
+
+    if current_equity > float(default_mem.get("generation_start_equity", current_equity)):
+        default_mem["generation_start_equity"] = round(current_equity, 2)
+
+    DNA['entry_score_min'] = min(82, max(DNA['entry_score_min'], 73 + int(default_mem.get("score_boost_req", 0))))
+    DNA['min_stop_pct'] = max(DNA['min_stop_pct'], float(default_mem.get("min_stop_override", DNA['min_stop_pct'])))
+    DNA['partial_tp_r'] = max(DNA['partial_tp_r'], float(default_mem.get("partial_tp_r_override", DNA['partial_tp_r'])))
+    return default_mem
+
+
+def save_memory_file(learned_mem):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(learned_mem, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"   ⚠️ Eroare salvare {MEMORY_FILE}: {e}")
+
+
+def persist_files_to_github(files, commit_msg):
+    """Commit & push automat, ca memoria să supraviețuiască între rulări (workflow-ul are nevoie de contents: write)."""
+    def _run(*args):
+        return subprocess.run(list(args), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _run("git", "config", "user.name", "TradingChampionBot")
+        _run("git", "config", "user.email", "bot@users.noreply.github.com")
+        _run("git", "add", *files)
+        _run("git", "commit", "-m", f"{commit_msg} [skip ci]")
+        _run("git", "pull", "--rebase", "--autostash")
+        _run("git", "push")
+    except Exception:
+        pass
+
+
+def analyze_closed_trades_and_learn(tc, learned_mem):
+    """
+    Citește ultimele 500 de ordine închise și învață:
+      - banuri pe simbol (doar pe date RECENTE, expiră singure);
+      - statistică pe SETUP (via client_order_id) -> dezactivează setup-urile cu expectanță negativă.
+    """
+    mem = {}
+    now = datetime.now(timezone.utc)
+    cooldown_syms = active_blacklist(learned_mem, now)
+    portfolio_loss_streak = 0
+    sym_stats = {}
+    setup_stats = {}
+    setup_of = {}
+    win_recent = timedelta(hours=72)
+    win_setup = timedelta(days=SETUP_WINDOW_DAYS)
+    win_loss_streak = timedelta(hours=48)
+
+    try:
+        closed = tc.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500))
+        filled = [o for o in closed if o.filled_avg_price is not None and float(o.filled_qty or 0) > 0
+                  and o.filled_at is not None]
+        filled.sort(key=lambda o: o.filled_at)
+
+        book = {}
+        for o in filled:
+            sym = norm(o.symbol)
+            px = float(o.filled_avg_price)
+            qty = float(o.filled_qty)
+            val = qty * px
+            if val < DUST_THRESHOLD_USD:
+                continue
+
+            st = sym_stats.setdefault(sym, {
+                'wins': 0, 'losses': 0, 'net_usd': 0.0, 'streak_losses': 0, 'invested': 0.0,
+                'recent_n': 0, 'recent_wins': 0, 'recent_net': 0.0, 'last_loss_at': None})
+            b = book.setdefault(sym, [0.0, 0.0])
+
+            if o.side == OrderSide.BUY:
+                mem[sym] = {'entry_time': o.filled_at, 'scaled_out': False, 'last_sell_time': None}
+                b[0] += qty
+                b[1] += val
+                st['invested'] = max(st['invested'], b[1])
+                tag = parse_setup_tag(getattr(o, 'client_order_id', None))
+                if tag:
+                    setup_of[sym] = tag
+            elif o.side == OrderSide.SELL and b[0] > 1e-7:
+                mem.setdefault(sym, {'entry_time': None, 'scaled_out': True, 'last_sell_time': o.filled_at})
+                mem[sym]['scaled_out'] = True
+                mem[sym]['last_sell_time'] = o.filled_at
+
+                sell_qty = min(qty, b[0])
+                avg_entry = b[1] / b[0]
+                pnl_usd = net_trade_pnl(sym, avg_entry, px, sell_qty)
+                b[0] -= sell_qty
+                b[1] -= avg_entry * sell_qty
+                age = now - o.filled_at
+
+                st['net_usd'] += pnl_usd
+                if pnl_usd > 0:
+                    st['wins'] += 1
+                    st['streak_losses'] = 0
+                    portfolio_loss_streak = 0
+                else:
+                    st['losses'] += 1
+                    st['streak_losses'] += 1
+                    st['last_loss_at'] = o.filled_at
+                    portfolio_loss_streak += 1
+
+                if age < win_recent:
+                    st['recent_n'] += 1
+                    st['recent_net'] += pnl_usd
+                    if pnl_usd > 0:
+                        st['recent_wins'] += 1
+
+                if age < win_setup:
+                    ss = setup_stats.setdefault(setup_of.get(sym, "UNKNOWN"),
+                                                {'wins': 0, 'losses': 0, 'gross_win': 0.0, 'gross_loss': 0.0})
+                    if pnl_usd > 0:
+                        ss['wins'] += 1
+                        ss['gross_win'] += pnl_usd
+                    else:
+                        ss['losses'] += 1
+                        ss['gross_loss'] += abs(pnl_usd)
+
+                if age.total_seconds() < DNA['reentry_cooldown_min'] * 60:
+                    cooldown_syms.add(sym)
+
+        # --- BAN PE SIMBOL: doar dacă pierderile sunt RECENTE (se debanează singur după 48-72h) ---
+        newly_banned = []
+        for sym, st in sym_stats.items():
+            if sym in ("BTCUSD", "PAXGUSD", "SPY", "QQQ", "GLD"):
+                continue
+            recent_loss = st['last_loss_at'] is not None and (now - st['last_loss_at']) < win_loss_streak
+            recent_wr = (st['recent_wins'] / st['recent_n']) if st['recent_n'] > 0 else 0.5
+            bad_streak = st['streak_losses'] >= 3
+            bad_recent = st['recent_n'] >= 4 and st['recent_net'] <= -250.0 and recent_wr < 0.35
+            if recent_loss and (bad_streak or bad_recent):
+                if sym not in cooldown_syms:
+                    newly_banned.append(f"{sym} ({st['recent_net']:+.0f}$)")
+                cooldown_syms.add(sym)
+        if newly_banned:
+            print(f"🧠 [AUTO-ÎNVĂȚARE] Monede blocate temporar pentru pierderi recente: {', '.join(newly_banned)}")
+
+        # --- STATISTICĂ PE SETUP: dezactivăm ce pierde de fapt bani ---
+        disabled = []
+        for tag, ss in sorted(setup_stats.items()):
+            n = ss['wins'] + ss['losses']
+            pf = (ss['gross_win'] / ss['gross_loss']) if ss['gross_loss'] > 0 else (99.0 if ss['gross_win'] > 0 else 0.0)
+            net = ss['gross_win'] - ss['gross_loss']
+            flag = ""
+            if tag != "UNKNOWN" and n >= SETUP_MIN_TRADES and pf < SETUP_MIN_PF and net < 0:
+                disabled.append(tag)
+                flag = " ⛔ DEZACTIVAT"
+            print(f"   📈 [SETUP {tag}] {n} tranzacții/{SETUP_WINDOW_DAYS}z | Net: {net:+.0f}$ | PF: {pf:.2f}{flag}")
+        learned_mem["disabled_setups"] = sorted(disabled)
+    except Exception as e:
+        print(f"   ⚠️ Eroare la analiza istoricului: {e}")
+
+    return mem, cooldown_syms, portfolio_loss_streak, sym_stats
+
+
+def execute_death_learn_and_rebirth(tc, equity, invested_ref, loss_usd, sym_stats, learned_mem, cooldown_syms, trigger_reason):
+    """
+    Declanșat când agentul pierde 20% din banii băgați în poziții:
+    1. Închide toate pozițiile curente.
+    2. Analizează ce monede au produs pierderea și le interzice 72h.
+    3. Își întărește filtrele (scor minim, stop-loss, take-profit).
+    4. Resetează baza pentru noua Generație și REPORNEȘTE SINGUR.
+    """
+    print("\n" + "=" * 75)
+    print(f"🚨🧠 [MOARTE, ÎNVĂȚARE & REPORNIRE AUTOMATĂ] Motiv: {trigger_reason}")
+    print("=" * 75)
+
+    bad_coins = [sym for sym, st in sym_stats.items() if st['recent_net'] < -100.0 and sym not in ("SPY", "GLD")]
+    try:
+        for p in tc.get_all_positions():
+            s = norm(p.symbol)
+            upl = float(getattr(p, 'unrealized_pl', 0.0) or 0.0)
+            if upl < -80.0 and s not in ("SPY", "GLD"):
+                bad_coins.append(s)
+    except Exception:
+        pass
+    bad_coins = sorted(list(set(bad_coins)))
+    good_coins = [sym for sym, st in sym_stats.items() if st['recent_net'] > 0]
+
+    new_gen = int(learned_mem.get("generation", 1)) + 1
+    lessons = [
+        f"Gen #{new_gen - 1} s-a încheiat la {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}: {trigger_reason}.",
+        f"Monede interzise {BLACKLIST_HOURS}h în urma autopsiei: {', '.join(bad_coins) or 'niciuna (pierderea a venit din mai multe poziții mici)'}.",
+        f"Setup-uri dezactivate acum: {', '.join(learned_mem.get('disabled_setups', [])) or 'niciunul'}.",
+        f"Noua Generație #{new_gen} pornește de la Equity {equity:,.2f}$ cu filtre mai stricte (+2 pct scor, stop lărgit).",
+    ]
+
+    learned_mem["generation"] = new_gen
+    learned_mem["generation_start_equity"] = round(equity, 2)
+    add_to_blacklist(learned_mem, bad_coins)
+    if good_coins:
+        learned_mem["preferred_symbols"] = sorted(list(set(learned_mem.get("preferred_symbols", []) + good_coins)))
+    learned_mem["score_boost_req"] = min(8, int(learned_mem.get("score_boost_req", 0)) + 2)
+    learned_mem["min_stop_override"] = round(min(0.024, float(learned_mem.get("min_stop_override", 0.018)) + 0.002), 4)
+    learned_mem["partial_tp_r_override"] = round(min(1.80, float(learned_mem.get("partial_tp_r_override", 1.35)) + 0.15), 2)
+    learned_mem["lessons_learned"] = lessons
+    learned_mem.setdefault("autopsy_history", []).append({
+        "timestamp": str(datetime.now(timezone.utc)),
+        "new_generation": new_gen,
+        "equity_at_rebirth": round(equity, 2),
+        "invested_capital_ref": round(invested_ref, 2),
+        "loss_on_invested_usd": round(loss_usd, 2),
+        "trigger": trigger_reason,
+        "banned": bad_coins,
+        "disabled_setups": list(learned_mem.get("disabled_setups", [])),
+    })
+    learned_mem["autopsy_history"] = learned_mem["autopsy_history"][-30:]
+
+    for line in lessons:
+        print(f"   📘 [LECȚIE ÎNVĂȚATĂ] {line}")
+
+    print("   🧹 Lichidez toate pozițiile vechi pentru a reporni curat în noua Generație...")
+    try:
+        tc.cancel_orders()
+        time.sleep(1.5)
+        tc.close_all_positions(cancel_orders=True)
+        time.sleep(2.0)
+    except Exception as e:
+        print(f"   ⚠️ Eroare la lichidare: {e}")
+
+    cooldown_syms.update(bad_coins)
+    DNA['entry_score_min'] = min(82, 73 + int(learned_mem["score_boost_req"]))
+    DNA['min_stop_pct'] = float(learned_mem["min_stop_override"])
+    DNA['partial_tp_r'] = float(learned_mem["partial_tp_r_override"])
+
+    save_memory_file(learned_mem)
+    persist_files_to_github([MEMORY_FILE], f"🔥 Auto-Rebirth Gen #{new_gen} & învățare din -20% investit")
+    print(f"🔥 [REPORNIRE AUTOMATĂ COMPLETĂ] Agentul rulează acum în Generația #{new_gen} (Scor min: {DNA['entry_score_min']})!")
+
+
+# ==========================================
+# 3. CURĂȚARE PRAF, CORELAȚII & SESIUNI ICT
+# ==========================================
+def is_correlated_with_held(pos_symbol, held_symbols):
+    """Previne cumpărarea simultană de active din același grup corelat (GLD+PAXG, SPY+QQQ, NVDA+AMD)."""
+    for grp in CORRELATED_GROUPS:
+        if pos_symbol in grp and any(h in grp for h in held_symbols):
+            return True
+    return False
 
 
 def get_ict_session_info(now_utc):
@@ -195,7 +537,6 @@ def get_active_positions_and_sweep_dust(tc):
             if mkt_val >= 0.01:
                 try:
                     tc.close_position(sym)
-                    print(f"🧹 [CURĂȚARE PRAF] Am închis restul rezidual pe {sym} ({mkt_val:.4f}$).")
                 except Exception:
                     pass
             continue
@@ -223,7 +564,7 @@ def filter_regular_stock_hours(df):
 
 
 # ==========================================
-# 3. RADAR SOCIAL MEDIA & ȘTIRI
+# 4. RADAR SOCIAL MEDIA & ȘTIRI
 # ==========================================
 def fetch_url_raw(url, headers=None, timeout=7):
     try:
@@ -331,7 +672,7 @@ def scan_social_media_and_sentiment():
 
 
 # ==========================================
-# 4. MOTORUL SMC + ICT + PRICE ACTION
+# 5. MOTORUL SMC + ICT PE 15 MINUTE
 # ==========================================
 def compute_indicators(df):
     c = df['close'].astype(float)
@@ -346,13 +687,13 @@ def compute_indicators(df):
     ind['ema_slow'] = c.ewm(span=DNA['ema_slow'], adjust=False).mean()
     ind['ema_trend'] = c.ewm(span=DNA['ema_trend'], adjust=False).mean()
 
-    ind['ema_1h_fast'] = c.ewm(span=108, adjust=False).mean()
-    ind['ema_1h_slow'] = c.ewm(span=252, adjust=False).mean()
-    ind['ret_2h'] = c.pct_change(24).fillna(0.0)
+    ind['ema_1h_fast'] = c.ewm(span=84, adjust=False).mean()
+    ind['ema_1h_slow'] = c.ewm(span=200, adjust=False).mean()
+    ind['ret_4h'] = c.pct_change(16).fillna(0.0)
 
     typ_price = (h + l + c) / 3.0
-    vol_sum = v.rolling(48, min_periods=5).sum().replace(0, np.nan)
-    ind['vwap'] = ((typ_price * v).rolling(48, min_periods=5).sum() / vol_sum).fillna(c)
+    vol_sum = v.rolling(32, min_periods=5).sum().replace(0, np.nan)
+    ind['vwap'] = ((typ_price * v).rolling(32, min_periods=5).sum() / vol_sum).fillna(c)
 
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
@@ -361,8 +702,7 @@ def compute_indicators(df):
     rsi = 100 - 100 / (1 + rs)
     rsi = rsi.where(loss != 0, np.where(gain > 0, 100.0, 50.0)).fillna(50.0)
     ind['rsi'] = rsi
-    ind['rsi_falling'] = rsi < (rsi.shift(3) - 3.5)
-    ind['rsi_min3'] = rsi.rolling(3).min()
+    ind['rsi_falling'] = rsi < (rsi.shift(3) - 4.0)
 
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     hist = macd - macd.ewm(span=9, adjust=False).mean()
@@ -395,7 +735,6 @@ def compute_indicators(df):
     avg_vol = v.rolling(20).mean()
     ind['rvol'] = (v / avg_vol.replace(0, np.nan)).fillna(1.0)
 
-    # A. LUMÂNĂRI JAPONEZE & INSTITUTIONAL DISPLACEMENT
     rng = (h - l).clip(lower=1e-12)
     body = (c - o).abs()
     body_top = pd.concat([c, o], axis=1).max(axis=1)
@@ -410,20 +749,19 @@ def compute_indicators(df):
     prev2_o, prev2_c = o.shift(2), c.shift(2)
     prev2_body = body.shift(2)
 
-    ind['bull_hammer'] = (lower_wick >= 0.50) & (upper_wick <= 0.22) & (bb_pos <= 0.60)
+    ind['bull_hammer'] = (lower_wick >= 0.50) & (upper_wick <= 0.22) & (bb_pos <= 0.55)
     ind['dragonfly_doji'] = (body_ratio <= 0.18) & (lower_wick >= 0.60) & (upper_wick <= 0.20)
     ind['bull_engulf'] = (prev_c < prev_o) & (c > o) & (c >= prev_o) & (o <= prev_c * 1.001) & (body >= prev_body * 1.05)
     ind['morning_star'] = (prev2_c < prev2_o) & (prev2_body > atr * 0.4) & (prev_body < prev2_body * 0.55) \
                           & (c > o) & (c >= (prev2_o + prev2_c) / 2.0)
 
-    ind['shooting_star'] = (upper_wick >= 0.52) & (lower_wick <= 0.22) & (body_ratio <= 0.38) & (bb_pos >= 0.70)
-    ind['gravestone_doji'] = (body_ratio <= 0.18) & (upper_wick >= 0.60) & (bb_pos >= 0.70)
-    ind['bear_engulf'] = (prev_c > prev_o) & (c < o) & (c <= prev_o) & (body >= prev_body * 1.05) & (bb_pos >= 0.62)
-    ind['bull_displacement'] = (c > o) & (body >= atr * 1.25) & (body_ratio >= 0.62)
+    ind['shooting_star'] = (upper_wick >= 0.55) & (lower_wick <= 0.20) & (body_ratio <= 0.35) & (bb_pos >= 0.78)
+    ind['gravestone_doji'] = (body_ratio <= 0.18) & (upper_wick >= 0.62) & (bb_pos >= 0.78)
+    ind['bear_engulf'] = (prev_c > prev_o) & (c < o) & (c <= prev_o) & (body >= prev_body * 1.10) & (bb_pos >= 0.72)
+    ind['bull_displacement'] = (c > o) & (body >= atr * 1.20) & (body_ratio >= 0.60)
 
-    # B. SMART MONEY CONCEPTS: FVG, ORDER BLOCKS, LIQUIDITY SWEEP, PD ARRAYS
-    swing_hi = h.rolling(36, min_periods=12).max()
-    swing_lo = l.rolling(36, min_periods=12).min()
+    swing_hi = h.rolling(32, min_periods=12).max()
+    swing_lo = l.rolling(32, min_periods=12).min()
     deal_rng = (swing_hi - swing_lo).replace(0, np.nan)
     ind['pd_pos'] = ((c - swing_lo) / deal_rng).fillna(0.5)
     ind['fib_retrace'] = ((swing_hi - c) / deal_rng).fillna(0.5)
@@ -432,44 +770,46 @@ def compute_indicators(df):
     ind['ssl_low12'] = l.shift(2).rolling(14).min()
     ind['low3'] = l.rolling(3).min()
 
-    swept_recent = (l <= ind['ssl_low12'] * 1.0005) | (l.shift(1) <= ind['ssl_low12'].shift(1) * 1.0005)
+    swept_recent = (l <= ind['ssl_low12'] * 1.0008) | (l.shift(1) <= ind['ssl_low12'].shift(1) * 1.0008)
     ind['liquidity_sweep'] = swept_recent & (c > ind['ssl_low12']) & (c > o)
 
     ind['bos_up'] = (c > ind['hh12']) & (c > o)
     minor_lh = h.shift(1).rolling(5).max()
     ind['mss_choch'] = ind['liquidity_sweep'] & ((c > minor_lh) | ind['bull_engulf'] | ind['bull_displacement'])
 
-    fvg_created = (l > h.shift(2)) & (c.shift(1) > o.shift(1)) & (body.shift(1) >= atr.shift(1) * 0.7)
-    fvg_bot_series = h.shift(2).where(fvg_created, np.nan).ffill(limit=18)
-    fvg_top_series = l.where(fvg_created, np.nan).ffill(limit=18)
+    # FIX V10.2: zonele FVG / Order Block sunt valabile doar de la lumânarea URMĂTOARE (.shift(1)).
+    # Înainte, "retest"-ul era adevărat chiar pe lumânarea care crea zona = cumpărai vârful impulsului.
+    fvg_created = (l > h.shift(2)) & (c.shift(1) > o.shift(1)) & (body.shift(1) >= atr.shift(1) * 0.65)
+    fvg_bot_series = h.shift(2).where(fvg_created, np.nan).ffill(limit=16).shift(1)
+    fvg_top_series = l.where(fvg_created, np.nan).ffill(limit=16).shift(1)
     fvg_mid_series = (fvg_bot_series + fvg_top_series) / 2.0
     ind['fvg_retest'] = fvg_bot_series.notna() & (l <= fvg_top_series * 1.002) & (c >= fvg_mid_series * 0.998)
 
     ob_created = (c.shift(1) < o.shift(1)) & (ind['bull_displacement'] | ind['bull_engulf'])
-    ob_bot_series = l.shift(1).where(ob_created, np.nan).ffill(limit=24)
-    ob_top_series = h.shift(1).where(ob_created, np.nan).ffill(limit=24)
+    ob_bot_series = l.shift(1).where(ob_created, np.nan).ffill(limit=20).shift(1)
+    ob_top_series = h.shift(1).where(ob_created, np.nan).ffill(limit=20).shift(1)
     ind['ob_retest'] = ob_bot_series.notna() & (l <= ob_top_series * 1.002) & (c >= ob_bot_series) & (c > o)
 
     return ind
 
 
-def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2h=None, entry_time=None, kz_bonus=0):
+def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_4h=None,
+              entry_time=None, kz_bonus=0, is_preferred=False, is_crypto=True):
     r = ind.iloc[i]
     bar_close = float(r['close'])
     bar_open = float(r['open'])
     price = float(live_price) if live_price is not None else bar_close
     atr = float(r['atr'])
     if not np.isfinite(atr) or atr <= 0:
-        atr = price * 0.003
+        atr = price * 0.005
 
     ema_f, ema_s, ema_t = float(r['ema_fast']), float(r['ema_slow']), float(r['ema_trend'])
     ema_1h_f, ema_1h_s = float(r['ema_1h_fast']), float(r['ema_1h_slow'])
     vwap, adx = float(r['vwap']), float(r['adx'])
-    ret_2h = float(r['ret_2h'])
+    ret_4h = float(r['ret_4h'])
     rsi, hist = float(r['rsi']), float(r['macd_hist'])
     macd_rising, rsi_falling = bool(r['macd_rising']), bool(r['rsi_falling'])
     bb, rvol, wick = float(r['bb_pos']), float(r['rvol']), float(r['wick'])
-    hh12 = float(r['hh12'])
     pd_pos = float(r['pd_pos'])
     fib_retrace = float(r['fib_retrace'])
     std_z = float(r['std_zscore'])
@@ -497,76 +837,77 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
     trend_up = (ema_f >= ema_s * 0.999) and (ema_s >= ema_t * 0.998) and (price > ema_t)
     htf_1h_ok = (price >= ema_1h_f * 0.993) and (ema_1h_f >= ema_1h_s * 0.990)
     above_vwap = price >= vwap
-    bullish_action = (price > bar_open) or (bar_close > bar_open)
+    bullish_action = (price > bar_open) and (bar_close > bar_open)
 
-    in_discount = pd_pos <= 0.55
-    in_ote_golden_zone = 0.45 <= fib_retrace <= 0.79
+    in_discount = pd_pos <= 0.58
+    in_ote_golden_zone = 0.42 <= fib_retrace <= 0.79
 
     ceiling, why = False, ""
-    if is_bear_engulf:
-        ceiling, why = True, "Bearish Engulfing în vârf (Regula Nr. 1 Pag. 33)"
-    elif is_shooting_star and not macd_rising:
-        ceiling, why = True, "Shooting Star / Gravestone Doji la rezistență (Pag. 34, 39)"
-    elif std_z >= 2.3 and rsi_falling:
-        ceiling, why = True, f"Țintă Deviație Standard (+{std_z:.1f} SD - Pag. 254) atinsă"
-    elif bool(r['macd_losing']) and (rsi_falling or rvol < 0.80):
-        ceiling, why = True, "MACD pierde viteză + cumpărători epuizați"
-    elif wick > 0.58 and bb > 0.78 and not macd_rising:
-        ceiling, why = True, "Respingere din zona de Supply (Wick Rejection)"
+    if is_bear_engulf and pd_pos >= 0.72:
+        ceiling, why = True, "Bearish Engulfing în zona Extreme Premium (>72%)"
+    elif is_shooting_star and not macd_rising and pd_pos >= 0.75:
+        ceiling, why = True, "Shooting Star la rezistență în Premium"
+    elif std_z >= 2.5 and rsi_falling:
+        ceiling, why = True, f"Țintă Deviație Standard (+{std_z:.1f} SD) atinsă"
 
     confluences = 0
     if htf_1h_ok:
         confluences += 1
     if trend_up or mss_choch:
         confluences += 1
-    if in_discount or in_ote_golden_zone or above_vwap:
+    if in_discount or in_ote_golden_zone:
         confluences += 1
-    if fvg_retest or ob_retest or liq_sweep or bos_up:
+    if fvg_retest or ob_retest or liq_sweep:
         confluences += 1
     if candle_bull_name or (bullish_action and macd_rising):
         confluences += 1
-    if rvol >= 1.10 or adx >= 19:
+    if rvol >= 1.10 or adx >= 20:
         confluences += 1
 
     score, setup, reasons = 0, None, []
 
-    if (liq_sweep or mss_choch) and htf_1h_ok and bullish_action and macd_rising:
-        score, setup = 78, 'LIQUIDITY_SWEEP'
-        reasons.append("SMC Liquidity Sweep (Stop-Hunt) + MSS")
-    elif (fvg_retest or ob_retest) and htf_1h_ok and bullish_action and macd_rising and 38 <= rsi <= 68:
-        score, setup = 76, 'SMC_OB_FVG'
+    # FIX V10.2: LIQUIDITY_SWEEP cere preț >= EMA50 (nu cumpărăm "sweep"-uri în downtrend)
+    if (liq_sweep or mss_choch) and htf_1h_ok and price >= ema_t * 0.995 and bullish_action and macd_rising and pd_pos <= 0.60:
+        score, setup = 80, 'LIQUIDITY_SWEEP'
+        reasons.append("SMC Liquidity Sweep + MSS în Discount")
+    elif (fvg_retest or ob_retest) and htf_1h_ok and bullish_action and macd_rising and pd_pos <= 0.65 and 38 <= rsi <= 65:
+        score, setup = 78, 'SMC_OB_FVG'
         zone_tag = "OrderBlock+FVG" if (fvg_retest and ob_retest) else ("FVG 50%" if fvg_retest else "OrderBlock")
         if in_ote_golden_zone:
             score += 4
             zone_tag += "+OTE(61.8%)"
         reasons.append(f"Retest {zone_tag}")
-    elif trend_up and htf_1h_ok and above_vwap and macd_rising and 48 <= rsi <= 72 \
-            and (bos_up or price > hh12) and pd_pos <= 0.90 and (rvol >= 1.15 or adx >= 20):
-        score, setup = 74, 'BOS_BREAKOUT'
-        reasons.append(f"BOS Structure+VWAP(Vol {rvol:.1f}x)")
-    elif trend_up and htf_1h_ok and bullish_action and macd_rising and 40 <= rsi <= 62 \
-            and (in_discount or in_ote_golden_zone or float(r['low3']) <= max(ema_s, vwap) * 1.003) \
-            and price > ema_f and bb < 0.80:
-        score, setup = 72, 'OTE_PULLBACK'
-        reasons.append("Pullback în Discount/OTE")
-    elif candle_bull_name and htf_1h_ok and in_discount and price > ema_f and macd_rising and rvol >= 1.05:
-        score, setup = 71, 'PRICE_ACTION'
-        reasons.append(f"🕯️ {candle_bull_name} în Discount")
+    elif trend_up and htf_1h_ok and bullish_action and macd_rising and 40 <= rsi <= 60 \
+            and (in_discount or in_ote_golden_zone) and float(r['low3']) <= max(ema_s, vwap) * 1.003 and price > ema_f:
+        score, setup = 75, 'OTE_PULLBACK'
+        reasons.append("Pullback instituțional în Discount/OTE")
+    elif (not is_crypto or is_preferred) and trend_up and htf_1h_ok and above_vwap and macd_rising \
+            and 50 <= rsi <= 68 and bos_up and pd_pos <= 0.78 and rvol >= 1.20:
+        score, setup = 74, 'BOS_LEADER'
+        reasons.append(f"BOS Lider Instituțional(Vol {rvol:.1f}x)")
+
+    # FIX V10.2: CHASE GUARD - semnalul e pe lumânarea închisă; dacă prețul live a fugit deja, nu mai intrăm.
+    if setup and price > bar_close + DNA['chase_atr_mult'] * atr:
+        reasons = [f"Chase guard: preț live +{(price - bar_close) / atr:.1f} ATR peste semnal"]
+        score, setup = 0, None
 
     if setup:
-        if candle_bull_name and setup != 'PRICE_ACTION':
-            score += 5
-            reasons.append(f"🕯️ {candle_bull_name}(+5)")
+        if is_preferred:
+            score += 3
+            reasons.append("Activ Lider(+3)")
+        if candle_bull_name:
+            score += 4
+            reasons.append(f"🕯️ {candle_bull_name}(+4)")
         if kz_bonus > 0:
             score += kz_bonus
             reasons.append(f"Killzone(+{kz_bonus})")
-        if btc_ret_2h is not None:
-            rel_strength = ret_2h - btc_ret_2h
-            if rel_strength >= 0.004:
+        if btc_ret_4h is not None:
+            rel_strength = ret_4h - btc_ret_4h
+            if rel_strength >= 0.005:
                 score += 4
                 reasons.append(f"Lider vs BTC({rel_strength*100:+.1f}%)")
-            elif rel_strength <= -0.010:
-                score -= 6
+            elif rel_strength <= -0.008:
+                score -= 8
                 reasons.append(f"Slab vs BTC({rel_strength*100:+.1f}%)")
         if social_bonus:
             score += social_bonus
@@ -585,7 +926,7 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
         'price': price, 'bar_close': bar_close, 'atr': atr, 'atr_pct': atr / price,
         'ema_fast': ema_f, 'ema_slow': ema_s, 'ema_trend': ema_t, 'vwap': vwap, 'adx': adx,
         'rsi': rsi, 'macd_hist': hist, 'macd_rising': macd_rising,
-        'trend_up': trend_up, 'ret_2h': ret_2h, 'pd_pos': pd_pos, 'confluences': confluences,
+        'trend_up': trend_up, 'ret_4h': ret_4h, 'pd_pos': pd_pos, 'confluences': confluences,
         'peak_since_entry': max(price, peak_since_entry),
         'profit_ceiling_hit': ceiling, 'ceiling_reason': why,
         'score': score, 'setup': setup, 'social': int(social_bonus),
@@ -593,42 +934,40 @@ def signal_at(ind, i, social_bonus=0, live_price=None, live_high=None, btc_ret_2
     }
 
 
-def entry_allowed(m, cost_rt, is_asian_accum=False):
+def entry_allowed(m, cost_rt, is_asian_accum=False, is_crypto=False):
     min_req = DNA['asian_accumulation_score'] if is_asian_accum else DNA['entry_score_min']
+    if is_crypto:
+        min_req += DNA['crypto_score_premium']
     if not m['setup'] or m['confluences'] < DNA['min_confluences'] or m['score'] < min_req or m['profit_ceiling_hit']:
         return False
     return m['atr_pct'] * DNA['vol_cost_mult'] >= cost_rt
 
 
-def exit_decision(profit, m, init_stop_pct, cost_rt, market_val=20000.0):
+def exit_decision(profit, m, init_stop_pct, cost_rt, market_val=20000.0, scaled_out=False):
     trend_broken = m['ema_fast'] < m['ema_slow'] and not m['macd_rising'] and m['price'] < m['vwap']
 
-    # 1. RECYCLER MICRO-POZIȚII: eliberează slotul dacă o poziție e sub 3.500$ (ex: UNIUSD 1.624$) și nu are setup SMC
-    if market_val < MICRO_POS_USD and profit > -0.010 and m['score'] < 70:
+    # FIX V10.2: runner-ul rămas după take-partial NU mai e "reciclat" ca micro-poziție
+    if (not scaled_out) and market_val < MICRO_POS_USD and profit > -0.010 and m['score'] < 70:
         return f"Reciclare slot micro-poziție ({market_val:.0f}$) pentru alocare completă"
 
-    # 2. Țintă Distribuție / Spike Harvester
-    if profit >= DNA['spike_harvest_pct'] and (m['rsi'] > 73 or m['profit_ceiling_hit']):
+    if profit >= DNA['spike_harvest_pct'] and (m['rsi'] > 75 or m['profit_ceiling_hit']):
         return f"Țintă Distribuție / Spike încasat (+{profit*100:.2f}%)"
 
-    # 3. CHoCH Bearish pe poziții vechi
     if profit <= DNA['legacy_cut_pct'] and trend_broken:
-        return f"CHoCH Bearish sub {DNA['legacy_cut_pct']*100:.1f}% (structură + VWAP pierdute)"
+        return f"CHoCH Bearish sub {DNA['legacy_cut_pct']*100:.1f}% (structură 15m + VWAP pierdute)"
 
-    # 4. Plafon SMC / Price Action
     if DNA['use_exhaustion_exit']:
         min_net = cost_rt + (init_stop_pct * DNA['exhaustion_min_r'])
         if profit >= min_net and m['profit_ceiling_hit']:
-            return f"Plafon SMC/PriceAction la >{DNA['exhaustion_min_r']}R: {m['ceiling_reason']}"
+            return f"Plafon Extreme Premium la >{DNA['exhaustion_min_r']}R: {m['ceiling_reason']}"
 
-    # 5. Stop la știri negative
-    if m['social'] <= -5 and trend_broken and profit <= -init_stop_pct * DNA['soft_stop_frac_news']:
+    if m['social'] <= -6 and trend_broken and profit <= -init_stop_pct * DNA['soft_stop_frac_news']:
         return "Stop controlat: structură ruptă + știri negative"
     return None
 
 
 # ==========================================
-# 5. EXECUȚIE V9.1: LIMIT ENTRY, SL TO BE, PARTIALS & PREMIUM TRAIL
+# 6. EXECUȚIE ORDINE LIMIT & PROTECȚIE STOP SERVER
 # ==========================================
 def get_open_orders(tc):
     try:
@@ -636,54 +975,6 @@ def get_open_orders(tc):
     except Exception as e:
         print(f"   ⚠️ Nu pot citi ordinele deschise: {e}")
         return []
-
-
-def build_position_memory_and_cooldowns(tc):
-    mem = {}
-    cooldown_syms = set()
-    portfolio_loss_streak = 0
-    now = datetime.now(timezone.utc)
-    try:
-        closed = tc.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=300))
-        filled = [o for o in closed if o.filled_avg_price is not None and float(o.filled_qty or 0) > 0
-                  and o.filled_at is not None]
-        filled.sort(key=lambda o: o.filled_at)
-
-        last_buy_px = {}
-        streak_losses = {}
-        last_loss_time = {}
-
-        for o in filled:
-            sym = norm(o.symbol)
-            px = float(o.filled_avg_price)
-            qty = float(o.filled_qty)
-            if qty * px < DUST_THRESHOLD_USD:
-                continue
-            if o.side == OrderSide.BUY:
-                mem[sym] = {'entry_time': o.filled_at, 'scaled_out': False, 'last_sell_time': None}
-                last_buy_px[sym] = px
-            elif o.side == OrderSide.SELL:
-                if sym in mem:
-                    mem[sym]['scaled_out'] = True
-                    mem[sym]['last_sell_time'] = o.filled_at
-                if (now - o.filled_at).total_seconds() < DNA['reentry_cooldown_min'] * 60:
-                    cooldown_syms.add(sym)
-                if sym in last_buy_px:
-                    if px < last_buy_px[sym]:
-                        streak_losses[sym] = streak_losses.get(sym, 0) + 1
-                        last_loss_time[sym] = o.filled_at
-                        portfolio_loss_streak += 1
-                    else:
-                        streak_losses[sym] = 0
-                        portfolio_loss_streak = 0
-
-        for sym, losses in streak_losses.items():
-            if losses >= 2 and sym in last_loss_time:
-                if (now - last_loss_time[sym]).total_seconds() < 10800:
-                    cooldown_syms.add(sym)
-    except Exception:
-        pass
-    return mem, cooldown_syms, portfolio_loss_streak
 
 
 def find_stop_order(open_orders, pos_symbol):
@@ -710,16 +1001,18 @@ def place_stop(tc, symbol, qty, stop_price, is_crypto):
     return stop_price
 
 
-def submit_smart_buy(tc, symbol, invest_usd, live_price, is_crypto):
-    """Plasează ordin LIMIT la intrarea în FVG/OB pentru a evita slippage-ul, cu fallback rapid."""
-    limit_px = round_price(live_price * 1.0006, is_crypto)
+def submit_smart_buy(tc, symbol, invest_usd, live_price, is_crypto, setup="NA"):
+    limit_px = round_price(live_price * 1.0005, is_crypto)
     qty = truncate_qty(invest_usd / limit_px, is_crypto, decimals=6)
     if qty <= 0:
         return False
 
     tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
+    # Setup-ul intră în client_order_id -> botul poate învăța ce setup câștigă / pierde bani
+    cid = f"TC-{setup}-{uuid.uuid4().hex[:10]}"
     order = tc.submit_order(LimitOrderRequest(
-        symbol=symbol, qty=qty, limit_price=limit_px, side=OrderSide.BUY, time_in_force=tif
+        symbol=symbol, qty=qty, limit_price=limit_px, side=OrderSide.BUY, time_in_force=tif,
+        client_order_id=cid
     ))
     time.sleep(3.5)
     try:
@@ -730,10 +1023,11 @@ def submit_smart_buy(tc, symbol, invest_usd, live_price, is_crypto):
             return True
         tc.cancel_order_by_id(order.id)
         time.sleep(1.0)
-        if filled_q * live_price >= MIN_POSITION_USD * 0.5:
+        # FIX V10.2: acceptăm umplere parțială doar dacă poziția NU ar fi reciclată imediat ca micro-poziție
+        if filled_q * live_price >= MICRO_POS_USD:
             return True
         rem_usd = invest_usd - (filled_q * live_price)
-        if rem_usd >= 500.0:
+        if rem_usd >= 1000.0:
             if is_crypto:
                 tc.submit_order(MarketOrderRequest(
                     symbol=symbol, notional=round(rem_usd, 2), side=OrderSide.BUY, time_in_force=TimeInForce.GTC))
@@ -770,7 +1064,7 @@ def execute_partial_scale_out(tc, symbol, pos_symbol, pos, is_crypto, new_stop_p
 
         tif = TimeInForce.GTC if is_crypto else TimeInForce.DAY
         tc.submit_order(MarketOrderRequest(symbol=symbol, qty=sell_qty, side=OrderSide.SELL, time_in_force=tif))
-        print(f"   💰 [TAKE PARTIALS 50% - Pag. 273] Vândut {sell_qty} {symbol}! Restul de 50% are SL to BE+.")
+        print(f"   💰 [TAKE PARTIALS 50%] Vândut {sell_qty} {symbol} la profit! Restul de 50% are SL pe plus.")
         time.sleep(2.2)
         rem_pos = tc.get_open_position(pos_symbol)
         rem_qty = float(getattr(rem_pos, 'qty_available', None) or rem_pos.qty)
@@ -792,38 +1086,35 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
     cur_stop = float(cur.stop_price) if cur is not None else None
     init_stop_pct = effective_init_stop_pct(entry, cur_stop, stop_distance_pct(m))
 
-    # 1. Take Partials 50% + SL to BE (Pag. 254, 273)
     scaled_out = pos_mem.get('scaled_out', False)
     partial_target = cost_rt + init_stop_pct * DNA['partial_tp_r']
     if DNA['use_partial_tp'] and not scaled_out and profit >= partial_target:
-        lock_stop = min(live_price * 0.994, max(entry * (1.0 + cost_rt + 0.0015),
+        lock_stop = min(live_price * 0.992, max(entry * (1.0 + cost_rt + 0.003),
                                                 m['peak_since_entry'] - DNA['trail_atr_mult'] * m['atr']))
         if execute_partial_scale_out(tc, symbol, pos_symbol, pos, is_crypto, lock_stop):
             pos_mem['scaled_out'] = True
             return lock_stop
 
-    # 2. FAST FLOOR SHIELD: dacă o poziție e deja pe plus (>= +0.30%, ex: PAXGUSD și SPY),
-    # ridicăm imediat stop-ul la cel mult -0.60% sub intrare!
     max_allowed_floor = min(entry * (1.0 - init_stop_pct), live_price * (1.0 - init_stop_pct))
-    if profit >= 0.0030:
-        tighter_floor = entry * (1.0 - 0.0060)
-        max_allowed_floor = max(max_allowed_floor, tighter_floor)
+    # FIX V10.2: înainte stop-ul sărea la -0.8% de la intrare imediat ce profitul trecea de +0.8% (zgomot normal pe 15m).
+    # Acum: la +0.5R reducem riscul la jumătate; breakeven + trailing vin mai departe, la 0.85R.
+    if profit >= init_stop_pct * DNA['half_risk_trigger_r']:
+        max_allowed_floor = max(max_allowed_floor, entry * (1.0 - init_stop_pct * 0.5))
 
     new_stop = max(cur_stop, max_allowed_floor) if cur_stop else max_allowed_floor
 
-    # 3. SL to BE & Trailing Stop adaptiv (mai strâns dacă prețul a ajuns în Extreme Premium > 70%)
     already_in_profit_stop = (cur_stop is not None and cur_stop >= entry) or scaled_out
     if profit >= init_stop_pct * DNA['breakeven_trigger_r'] or already_in_profit_stop:
         peak_val = max(live_price, m['peak_since_entry'])
-        eff_trail_mult = DNA['trail_atr_mult'] * (0.75 if m['pd_pos'] >= 0.70 else 1.0)
+        eff_trail_mult = DNA['trail_atr_mult'] * (0.80 if m['pd_pos'] >= 0.78 else 1.0)
         trail = peak_val - eff_trail_mult * m['atr']
-        new_stop = max(new_stop, trail, entry * (1.0 + cost_rt))
+        new_stop = max(new_stop, trail, entry * (1.0 + cost_rt + 0.001))
 
-    new_stop = min(new_stop, live_price * 0.994)
+    new_stop = min(new_stop, live_price * 0.992)
 
     if cur_stop is not None:
         new_stop = max(new_stop, cur_stop)
-        if new_stop <= cur_stop * 1.0020:
+        if new_stop <= cur_stop * 1.0030:
             return cur_stop
         tc.cancel_order_by_id(cur.id)
         time.sleep(1.5)
@@ -831,13 +1122,13 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
             fresh_pos = tc.get_open_position(pos_symbol)
             q_to_stop = float(getattr(fresh_pos, 'qty_available', None) or fresh_pos.qty)
             placed = place_stop(tc, symbol, q_to_stop, new_stop, is_crypto)
-            print(f"   🛡️ [SL ACTUALIZAT V9.1] {symbol}: {cur_stop:.4f} -> {placed}")
+            print(f"   🛡️ [SL ACTUALIZAT V10.2] {symbol}: {cur_stop:.4f} -> {placed}")
             return placed
         except Exception as e:
             print(f"   ⚠️ Stop nou respins ({e}); refac stop-ul anterior")
             fresh_pos = tc.get_open_position(pos_symbol)
             q_to_stop = float(getattr(fresh_pos, 'qty_available', None) or fresh_pos.qty)
-            place_stop(tc, symbol, q_to_stop, min(cur_stop, live_price * 0.992), is_crypto)
+            place_stop(tc, symbol, q_to_stop, min(cur_stop, live_price * 0.990), is_crypto)
             return cur_stop
 
     q_initial = avail_qty if avail_qty > 0 else total_qty
@@ -871,16 +1162,17 @@ def manage_position(tc, symbol, pos, m, is_crypto, pos_mem, flatten_now=False):
     cur = find_stop_order(get_open_orders(tc), pos_symbol)
     cur_stop = float(cur.stop_price) if cur is not None else None
     init_stop_pct = effective_init_stop_pct(entry, cur_stop, stop_distance_pct(m))
-    stage_tag = "50% Runner" if pos_mem.get('scaled_out') else "100%"
+    scaled_out = bool(pos_mem.get('scaled_out'))
+    stage_tag = "50% Runner" if scaled_out else "100%"
     pd_zone = "Discount" if m['pd_pos'] <= 0.5 else "Premium"
 
     print(f"💼 [DEȚINUT {stage_tag}] {symbol:<8} | Val: {market_val:7.0f}$ | Live: {live_price:<10.4f} "
           f"| P/L: {profit*100:+.2f}% | Stop: {cur_stop or 0:<9.4f} | Zona: {pd_zone}({m['pd_pos']*100:.0f}%)")
 
-    reason = "Închidere înainte de bell (fără risc overnight)" if flatten_now \
-        else exit_decision(profit, m, init_stop_pct, cost_rt, market_val=market_val)
+    reason = "Închidere înainte de bell" if flatten_now \
+        else exit_decision(profit, m, init_stop_pct, cost_rt, market_val=market_val, scaled_out=scaled_out)
     if reason:
-        print(f"   🔔 [IEȘIRE V9.1] {symbol}: {reason} ({profit*100:+.2f}%)")
+        print(f"   🔔 [IEȘIRE V10.2] {symbol}: {reason} ({profit*100:+.2f}%)")
         return close_position_safe(tc, symbol, pos_symbol)
 
     try:
@@ -900,22 +1192,8 @@ def position_size_usd(equity, cash, gross, init_stop_pct, score, loss_streak=0):
 
 
 # ==========================================
-# 6. CONT: VÂRF, KILL-SWITCH, SCORECARD
+# 7. SCORECARD & DATE DE PIAȚĂ
 # ==========================================
-def get_peak_equity(tc, equity):
-    peak = max(STARTING_CAPITAL, equity)
-    if IGNORE_HISTORY_PEAK:
-        return peak
-    try:
-        hist = tc.get_portfolio_history(GetPortfolioHistoryRequest(period="1M", timeframe="1D"))
-        values = [float(e) for e in (hist.equity or []) if e is not None and float(e) > 0]
-        if values:
-            peak = max(peak, max(values))
-    except Exception:
-        pass
-    return peak
-
-
 def evaluate_scorecard(tc, equity):
     try:
         closed = tc.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500))
@@ -938,8 +1216,9 @@ def evaluate_scorecard(tc, equity):
         elif b[0] > 1e-7:
             sell_qty = min(qty, b[0])
             avg = b[1] / b[0]
-            pnl_usd.append((px - avg) * sell_qty)
-            pnl_pct.append(px / avg - 1.0)
+            pnl = net_trade_pnl(sym, avg, px, sell_qty)   # net de comision
+            pnl_usd.append(pnl)
+            pnl_pct.append(pnl / (avg * sell_qty))
             b[0] -= sell_qty
             b[1] -= avg * sell_qty
 
@@ -956,15 +1235,12 @@ def evaluate_scorecard(tc, equity):
     net = equity - STARTING_CAPITAL
 
     print("┌──────────────────────────────────────────────────────────────┐")
-    print(f"│ 💰 Profit total: {net:+,.2f}$ ({net / STARTING_CAPITAL * 100:+.2f}%)")
-    print(f"│ 🎯 Tranzacții închise: {total} | Win rate: {win_rate:.1f}% | Profit factor: {pf:.2f}")
+    print(f"│ 💰 Profit total cont: {net:+,.2f}$ ({net / STARTING_CAPITAL * 100:+.2f}%)")
+    print(f"│ 🎯 Tranzacții închise: {total} | Win rate: {win_rate:.1f}% | Profit factor (net comisioane): {pf:.2f}")
     print(f"│ 📊 Câștig mediu: +{avg_w:.2f}% | Pierdere medie: -{avg_l:.2f}% | Win rate de break-even: {breakeven_wr:.0f}%")
     print("└──────────────────────────────────────────────────────────────┘")
 
 
-# ==========================================
-# 7. DATE DE PIAȚĂ LA 5 MINUTE + LIVE
-# ==========================================
 def prepare_symbol_frames(bars_df, symbols, now, stale_bars, is_stock=False):
     out = {}
     if bars_df is None or bars_df.empty:
@@ -985,7 +1261,7 @@ def prepare_symbol_frames(bars_df, symbols, now, stale_bars, is_stock=False):
             df_ind = df.iloc[:-1]
         else:
             df_ind = df
-        if len(df_ind) < 90:
+        if len(df_ind) < 85:
             continue
         if not is_stock and (now - df.index[-1] > bar_td * stale_bars):
             continue
@@ -994,23 +1270,24 @@ def prepare_symbol_frames(bars_df, symbols, now, stale_bars, is_stock=False):
 
 
 # ==========================================
-# 8. CICLUL PRINCIPAL V9.1 (SMC & ICT)
+# 8. CICLUL PRINCIPAL V10.2
 # ==========================================
 def process_symbol(tc, symbol, pack, is_crypto, is_safe, held, ctx):
     ind, live_price, live_high = pack
     pos_symbol = norm(symbol)
     pos_mem = ctx['pos_memory'].setdefault(pos_symbol, {'entry_time': None, 'scaled_out': False})
-    btc_ret = ctx.get('btc_ret_2h') if (is_crypto and symbol != "BTC/USD" and not is_safe) else None
+    btc_ret = ctx.get('btc_ret_4h') if (is_crypto and symbol != "BTC/USD" and not is_safe) else None
+    is_pref = pos_symbol in ctx['preferred_syms']
 
     m = signal_at(
         ind, len(ind) - 1, ctx['social'].get(symbol, 0),
         live_price=live_price, live_high=live_high,
-        btc_ret_2h=btc_ret, entry_time=pos_mem.get('entry_time'),
-        kz_bonus=ctx['kz_bonus']
+        btc_ret_4h=btc_ret, entry_time=pos_mem.get('entry_time'),
+        kz_bonus=ctx['kz_bonus'], is_preferred=is_pref, is_crypto=is_crypto
     )
     if is_safe and ctx['risk_off'] and m['setup']:
         m['score'] += 15
-        m['reason'] += " + 🛡️ Safe-Haven Gold/Bonds (Pag. 188)"
+        m['reason'] += " + 🛡️ Safe-Haven Gold/Bonds"
 
     if pos_symbol in held:
         flatten = (not is_crypto) and ctx['flatten_stocks']
@@ -1025,13 +1302,17 @@ def process_symbol(tc, symbol, pack, is_crypto, is_safe, held, ctx):
         return
     if ctx['risk_off'] and not is_safe:
         return
-    if not entry_allowed(m, round_trip_cost(is_crypto), is_asian_accum=ctx['is_asian_accum']):
+    if not entry_allowed(m, round_trip_cost(is_crypto), is_asian_accum=ctx['is_asian_accum'], is_crypto=is_crypto):
+        return
+    if m['setup'] in ctx['disabled_setups']:
+        print(f"   ⛔ [SETUP DEZACTIVAT] {symbol}: {m['setup']} are expectanță negativă în ultimele {SETUP_WINDOW_DAYS} zile")
         return
 
     print(f"🟢 [SEMNAL {m['setup']}] {symbol:<8} | Live: {m['price']:.4f} | Scor: {m['score']} | {m['reason']}")
     ctx['candidates'].append({
         'symbol': symbol, 'pos_symbol': pos_symbol, 'price': m['price'], 'score': m['score'],
-        'is_crypto': is_crypto, 'reason': m['reason'], 'init_stop_pct': stop_distance_pct(m)})
+        'is_crypto': is_crypto, 'reason': m['reason'], 'init_stop_pct': stop_distance_pct(m),
+        'setup': m['setup']})
 
 
 def open_new_positions(tc, ctx, held, equity):
@@ -1046,19 +1327,23 @@ def open_new_positions(tc, ctx, held, equity):
             break
         if t['is_crypto'] and crypto_open >= DNA['max_crypto_positions']:
             continue
+        if is_correlated_with_held(t['pos_symbol'], open_syms):
+            print(f"   🔗 [ANTI-DUBLARE] Sar peste {t['symbol']} (avem deja un activ identic/corelat în portofoliu).")
+            continue
         try:
             cash = float(tc.get_account().cash)
             invest = position_size_usd(equity, cash, gross, t['init_stop_pct'], t['score'], ctx['loss_streak'])
             if invest < MIN_POSITION_USD:
                 continue
             sym, pos_sym = t['symbol'], t['pos_symbol']
-            print(f"🎯 [INTRARE V9.1 SMC/ICT] {sym}: ~{invest:.0f}$ | Stop: -{t['init_stop_pct']*100:.2f}% "
+            print(f"🎯 [INTRARE V10.2] {sym}: ~{invest:.0f}$ | Stop: -{t['init_stop_pct']*100:.2f}% "
                   f"| Scor {t['score']} ({t['reason']})")
 
-            if not submit_smart_buy(tc, sym, invest, t['price'], t['is_crypto']):
+            if not submit_smart_buy(tc, sym, invest, t['price'], t['is_crypto'], t.get('setup', 'NA')):
                 continue
 
             n_open += 1
+            open_syms.append(pos_sym)
             crypto_open += 1 if t['is_crypto'] else 0
             gross += invest
             ctx['pos_memory'][pos_sym] = {'entry_time': datetime.now(timezone.utc), 'scaled_out': False}
@@ -1074,61 +1359,106 @@ def open_new_positions(tc, ctx, held, equity):
             print(f"   ⚠️ Intrare eșuată pe {t['symbol']}: {e}")
 
 
-def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val, pos_memory, cooldown_syms, loss_streak, show_scorecard=False):
-    if os.path.exists(DEATH_FILE):
-        print("💀 Agentul este MORT (DEAD.lock există). Oprire.")
-        sys.exit(0)
+def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val,
+              pos_memory, cooldown_syms, loss_streak, sym_stats, learned_mem, show_scorecard=False):
+    if os.path.exists("DEAD.lock") and AUTO_REBIRTH:
+        try:
+            os.remove("DEAD.lock")
+        except Exception:
+            pass
 
     account = tc.get_account()
     equity = float(account.equity)
     last_equity = float(account.last_equity) if getattr(account, 'last_equity', None) else equity
-    peak = get_peak_equity(tc, equity)
-    death_threshold = peak * (1.0 - MAX_DRAWDOWN_PCT)
     daily_pnl = (equity - last_equity) / last_equity if last_equity > 0 else 0.0
     entries_blocked = daily_pnl <= -DAILY_LOSS_LIMIT_PCT
 
     held = get_active_positions_and_sweep_dust(tc)
+
+    # =========================================================================
+    # PIERDEREA DE 20% RAPORTATĂ LA BANII BĂGAȚI ÎN POZIȚII
+    # =========================================================================
+    invested_now = sum(abs(float(getattr(p, 'cost_basis', 0.0) or 0.0)) for p in held.values())
+    unrealized_pnl_now = sum(float(getattr(p, 'unrealized_pl', 0.0) or 0.0) for p in held.values())
+
+    if invested_now >= MIN_POSITION_USD:
+        learned_mem["avg_invested_capital"] = round(invested_now, 2)
+    invested_ref = max(invested_now, float(learned_mem.get("avg_invested_capital", 60000.0)), 25000.0)
+
+    gen_start_eq = float(learned_mem.get("generation_start_equity", equity))
+    if equity > gen_start_eq:
+        gen_start_eq = equity
+        learned_mem["generation_start_equity"] = round(equity, 2)
+
+    gen_loss_usd = max(0.0, gen_start_eq - equity)
+    max_allowed_loss_on_invested = invested_ref * INVESTED_MAX_LOSS_PCT
+    rebirth_equity_floor = gen_start_eq - max_allowed_loss_on_invested
+    loss_pct_of_invested = (gen_loss_usd / invested_ref) if invested_ref > 0 else 0.0
+
     now = datetime.now(timezone.utc)
     kz_name, kz_bonus, is_asian_accum = get_ict_session_info(now)
+    gen_num = learned_mem.get("generation", 1)
 
-    print(f"\n⚡ Scanare V9.1 ({kz_name}): {now.strftime('%H:%M:%S UTC')} "
-          f"| Equity: {equity:,.2f}$ | Poziții reale: {len(held)}/{DNA['max_positions']} | Kill-switch: {death_threshold:,.2f}$ | Azi: {daily_pnl*100:+.2f}%")
+    print(f"\n⚡ Scanare V10.2 Gen#{gen_num} ({kz_name}): {now.strftime('%H:%M:%S UTC')} "
+          f"| Equity: {equity:,.2f}$ | Peak gen: {gen_start_eq:,.0f}$ | Băgați în poziții: {invested_now:,.0f}$ "
+          f"| Pierdere/Investit: -{loss_pct_of_invested*100:.1f}% (Prag Rebirth -20%: {rebirth_equity_floor:,.0f}$) | Azi: {daily_pnl*100:+.2f}%")
     if entries_blocked:
-        print(f"🧯 Limita zilnică de pierdere ({DAILY_LOSS_LIMIT_PCT*100:.0f}%) atinsă: doar gestionăm pozițiile.")
+        print(f"🧯 Limita zilnică ({DAILY_LOSS_LIMIT_PCT*100:.1f}%) atinsă: doar protejăm pozițiile.")
     if show_scorecard:
         evaluate_scorecard(tc, equity)
 
-    if equity <= death_threshold:
-        print(f"🚨 [KILL-SWITCH] Scădere de {MAX_DRAWDOWN_PCT*100:.0f}% față de vârf. Închid tot.")
-        tc.cancel_orders()
-        time.sleep(1)
-        tc.close_all_positions(cancel_orders=True)
-        with open(DEATH_FILE, "w") as f:
-            f.write(f"Killed at {now} with equity {equity:.2f}$ (peak {peak:.2f}$)\n")
-        sys.exit(0)
+    # DECLANȘATOR 1: Pierderea din Generația curentă (drawdown de la peak) a atins 20% din banii băgați în poziții
+    if gen_loss_usd >= max_allowed_loss_on_invested:
+        execute_death_learn_and_rebirth(
+            tc, equity, invested_ref, gen_loss_usd, sym_stats, learned_mem, cooldown_syms,
+            f"Pierderea ({gen_loss_usd:,.0f}$) a atins 20% din suma băgată în poziții ({invested_ref:,.0f}$)"
+        )
+        return
+
+    # DECLANȘATOR 2: Pozițiile deschise acum au împreună -20% față de banii băgați în ele
+    if invested_now >= MIN_POSITION_USD and unrealized_pnl_now <= -(invested_now * INVESTED_MAX_LOSS_PCT):
+        execute_death_learn_and_rebirth(
+            tc, equity, invested_now, abs(unrealized_pnl_now), sym_stats, learned_mem, cooldown_syms,
+            f"Pozițiile curente au pierdut 20% ({unrealized_pnl_now:,.0f}$) din cei {invested_now:,.0f}$ băgați în ele"
+        )
+        return
+
+    # DECLANȘATOR 3: O monedă individuală a pierdut 20% din suma băgată în ea
+    for s_key, p_obj in list(held.items()):
+        c_basis = abs(float(getattr(p_obj, 'cost_basis', 0.0) or 0.0))
+        u_plpc = float(getattr(p_obj, 'unrealized_plpc', 0.0) or 0.0)
+        if c_basis >= MIN_POSITION_USD and u_plpc <= -INVESTED_MAX_LOSS_PCT:
+            execute_death_learn_and_rebirth(
+                tc, equity, c_basis, abs(float(getattr(p_obj, 'unrealized_pl', 0.0) or 0.0)),
+                sym_stats, learned_mem, cooldown_syms,
+                f"Moneda {s_key} a pierdut {u_plpc*100:.1f}% din cei {c_basis:,.0f}$ băgați în ea"
+            )
+            return
 
     crypto_bars = crypto_client.get_crypto_bars(CryptoBarsRequest(
-        symbol_or_symbols=ALL_CRYPTO, timeframe=bar_tf(), start=now - timedelta(days=2))).df
-    crypto_packs = prepare_symbol_frames(crypto_bars, ALL_CRYPTO, now, stale_bars=6, is_stock=False)
+        symbol_or_symbols=ALL_CRYPTO, timeframe=bar_tf(), start=now - timedelta(days=5))).df
+    crypto_packs = prepare_symbol_frames(crypto_bars, ALL_CRYPTO, now, stale_bars=5, is_stock=False)
 
     risk_off = False
-    btc_ret_2h = 0.0
+    btc_ret_4h = 0.0
     btc_pack = crypto_packs.get("BTC/USD")
     if btc_pack is not None:
         btc_ind, btc_live, _ = btc_pack
-        if len(btc_ind) > 6:
+        if len(btc_ind) > 4:
             lookback = max(1, int(30 / DNA['bar_minutes']))
             btc_change = float(btc_live / btc_ind['close'].iloc[-lookback] - 1.0)
-            btc_ret_2h = float(btc_ind['ret_2h'].iloc[-1])
+            btc_ret_4h = float(btc_ind['ret_4h'].iloc[-1])
             if btc_change < -0.012 or fear_greed_val <= 22:
                 risk_off = True
-                print(f"🛡️ [MOD REFUGIU - Pag. 188] BTC {btc_change*100:+.2f}% (30m), F&G {fear_greed_val}: doar Aur/Obligațiuni.")
+                print(f"🛡️ [MOD REFUGIU] BTC {btc_change*100:+.2f}% (30m), F&G {fear_greed_val}: doar Aur/Obligațiuni.")
 
     ctx = {
         'social': social_scores, 'risk_off': risk_off, 'entries_blocked': entries_blocked,
         'closed': set(), 'candidates': [], 'stock_entries_ok': False, 'flatten_stocks': False,
-        'pos_memory': pos_memory, 'cooldown_syms': cooldown_syms, 'btc_ret_2h': btc_ret_2h,
-        'kz_bonus': kz_bonus, 'is_asian_accum': is_asian_accum, 'loss_streak': loss_streak
+        'pos_memory': pos_memory, 'cooldown_syms': cooldown_syms, 'btc_ret_4h': btc_ret_4h,
+        'kz_bonus': kz_bonus, 'is_asian_accum': is_asian_accum, 'loss_streak': loss_streak,
+        'disabled_setups': set(learned_mem.get("disabled_setups", [])),
+        'preferred_syms': set(learned_mem.get("preferred_symbols", ["SPY", "QQQ", "GLD", "PAXGUSD", "BTCUSD", "NVDA"]))
     }
 
     for symbol, pack in crypto_packs.items():
@@ -1140,9 +1470,9 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val, po
         ctx['stock_entries_ok'] = 30 <= mtc <= 380
         ctx['flatten_stocks'] = FLATTEN_STOCKS_BEFORE_CLOSE and mtc <= FLATTEN_MIN
         stock_bars = stock_client.get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=ALL_STOCKS, timeframe=bar_tf(), start=now - timedelta(days=7),
+            symbol_or_symbols=ALL_STOCKS, timeframe=bar_tf(), start=now - timedelta(days=12),
             feed=DataFeed.IEX)).df
-        stock_packs = prepare_symbol_frames(stock_bars, ALL_STOCKS, now, stale_bars=8, is_stock=True)
+        stock_packs = prepare_symbol_frames(stock_bars, ALL_STOCKS, now, stale_bars=6, is_stock=True)
         for symbol, pack in stock_packs.items():
             process_symbol(tc, symbol, pack, False, symbol in SAFE_HAVEN_STOCKS, held, ctx)
 
@@ -1167,26 +1497,44 @@ def main():
     crypto_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
     stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-    print(f"🚀 AGENT V9.1 SMC & ICT pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) | Liquidity Sweep + FVG + OB + Limit Entry | "
-          f"cost round-trip crypto {round_trip_cost(True)*100:.2f}%")
-    social_scores, fear_greed_val = scan_social_media_and_sentiment()
-    pos_memory, cooldown_syms, loss_streak = build_position_memory_and_cooldowns(tc)
-    if cooldown_syms:
-        print(f"🧊 Monede în Cooldown temporar: {', '.join(sorted(cooldown_syms))}")
-    if loss_streak >= 2:
-        print(f"🛡️ [PROTECȚIE SERIE PIERZĂTOARE - Pag. 137] {loss_streak} pierderi recente: reducem miza la 65% până la primul câștig.")
+    first_run = not os.path.exists(MEMORY_FILE)
+    init_eq = float(tc.get_account().equity)
+    learned_mem = load_learned_memory(init_eq)
+    persisted_peak = float(learned_mem.get("generation_start_equity", init_eq))
 
-    for i in range(CYCLES_PER_RUN):
-        print(f"\n================ CICLUL {i + 1}/{CYCLES_PER_RUN} ================")
-        try:
-            run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val,
-                      pos_memory, cooldown_syms, loss_streak, show_scorecard=(i == 0))
-        except SystemExit:
-            raise
-        except Exception as e:
-            print(f"⚠️ Eroare temporară în ciclul {i + 1}: {e}")
-        if i < CYCLES_PER_RUN - 1:
-            time.sleep(CYCLE_SLEEP_SEC)
+    # FIX V10.2: fără fișierul comis în repo, fiecare rulare pornea cu peak = equity-ul de acum
+    # și pragul de -20% nu putea fi atins niciodată.
+    if first_run:
+        persist_files_to_github([MEMORY_FILE], "💾 Init memorie Gen #1")
+
+    print(f"🚀 AGENT V10.2 PHOENIX (Gen #{learned_mem.get('generation', 1)}) pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) "
+          f"| Prag Rebirth: -20% din banii băgați în poziții | Scor min: {DNA['entry_score_min']}")
+
+    social_scores, fear_greed_val = scan_social_media_and_sentiment()
+    pos_memory, cooldown_syms, loss_streak, sym_stats = analyze_closed_trades_and_learn(tc, learned_mem)
+
+    if cooldown_syms:
+        print(f"🧊 Monede blocate temporar de Motorul de Învățare: {', '.join(sorted(cooldown_syms))}")
+    if learned_mem.get("disabled_setups"):
+        print(f"⛔ Setup-uri dezactivate (expectanță negativă): {', '.join(learned_mem['disabled_setups'])}")
+
+    try:
+        for i in range(CYCLES_PER_RUN):
+            print(f"\n================ CICLUL {i + 1}/{CYCLES_PER_RUN} ================")
+            try:
+                run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val,
+                          pos_memory, cooldown_syms, loss_streak, sym_stats, learned_mem, show_scorecard=(i == 0))
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"⚠️ Eroare temporară în ciclul {i + 1}: {e}")
+            if i < CYCLES_PER_RUN - 1:
+                time.sleep(CYCLE_SLEEP_SEC)
+    finally:
+        save_memory_file(learned_mem)
+        new_peak = float(learned_mem.get("generation_start_equity", persisted_peak))
+        if new_peak >= persisted_peak * (1.0 + PEAK_PERSIST_STEP):
+            persist_files_to_github([MEMORY_FILE], f"💾 Peak equity Gen #{learned_mem.get('generation', 1)}: {new_peak:,.0f}$")
 
 
 if __name__ == "__main__":
