@@ -1,0 +1,20 @@
+{
+  "generation": 1,
+  "generation_start_equity": 88926.13,
+  "avg_invested_capital": 60000.0,
+  "blacklist_until": {},
+  "disabled_setups": [],
+  "preferred_symbols": [
+    "SPY",
+    "QQQ",
+    "GLD",
+    "PAXGUSD",
+    "BTCUSD",
+    "NVDA"
+  ],
+  "score_boost_req": 0,
+  "min_stop_override": 0.018,
+  "partial_tp_r_override": 1.35,
+  "lessons_learned": [],
+  "autopsy_history": []
+}
