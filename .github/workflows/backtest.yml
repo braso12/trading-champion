@@ -1,0 +1,32 @@
+name: Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Câte zile de istoric simulez"
+        default: "30"
+
+permissions:
+  contents: write
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Descarcă codul din repository
+        uses: actions/checkout@v4
+
+      - name: 2. Instalează Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 3. Instalează dependențele
+        run: pip install alpaca-py pandas numpy
+
+      - name: 4. Rulează backtest-ul (salvează BACKTEST_REPORT.json în repo)
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python -u github_champion.py --backtest --days ${{ github.event.inputs.days }}
