@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TRADING CHAMPION V10.2 — PHOENIX (fix-uri de logică + învățare reală)
+TRADING CHAMPION V10.3 — PHOENIX + BACKTEST (dovezi înainte de risc)
 
-Ce a fost reparat față de V10.1:
+NOU în V10.3:
+  A. Expunere totală 40% (era 78%), per poziție 15% (era 22%) - configurabile: MAX_TOTAL_EXPOSURE, MAX_SINGLE_EXPOSURE,
+     MAX_POSITIONS, MAX_CRYPTO_POSITIONS. Pozițiile vechi nu se lichidează forțat; botul nu deschide altele până scade expunerea.
+  B. Log clar când sare peste un semnal (limită poziții / limită crypto / fără loc).
+  C. Poziții cu simboluri din afara listei botului primesc stop de protecție și avertisment (înainte nu le gestiona nimeni).
+  D. Logica stop/trailing e acum într-o singură funcție (compute_trailing_stop), folosită și live, și în backtest.
+  E. BACKTEST: python github_champion.py --backtest --days 30
+     Simulează strategia pe istoric (comisioane + slippage), arată profit factor pe setup / clasă de active / simbol,
+     face un test in-sample (primele 2/3 din perioadă) vs out-of-sample (ultima treime) pentru variante de parametri
+     și scrie BACKTEST_REPORT.json. Setup-urile cu expectanță negativă din raport sunt dezactivate automat în live
+     (USE_BACKTEST_GATE=true, raportul expiră după 14 zile; DISABLED_SETUPS="A,B" le dezactivează manual).
+
+Ce a fost reparat în V10.2 față de V10.1:
   1. STAREA SE PIERDEA LA FIECARE RULARE: LEARNED_MEMORY.json se salva doar la rebirth, deci pe GitHub Actions
      vârful de equity ("peak") și generația reveneau la zero la fiecare rulare -> pragul de -20% nu putea
      ajunge niciodată. Acum: fișierul se commit-uiește la prima rulare și când peak-ul urcă cu >=0.5%.
@@ -80,6 +92,8 @@ SETUP_WINDOW_DAYS = 7         # fereastra pentru statistica pe setup
 SETUP_MIN_TRADES = 8          # minim de tranzacții înainte să dezactivăm un setup
 SETUP_MIN_PF = 0.85           # profit factor sub care un setup e dezactivat
 PEAK_PERSIST_STEP = 0.005     # commit pe GitHub când peak-ul urcă cu >= 0.5%
+BACKTEST_FILE = "BACKTEST_REPORT.json"
+USE_BACKTEST_GATE = os.environ.get("USE_BACKTEST_GATE", "true").lower() != "false"
 
 # Alpaca crypto Tier 1: taker 0.25%, maker 0.15% (scade la 0.22% taker peste 100k$ volum / 30 zile)
 CRYPTO_FEE_PCT = float(os.environ.get("CRYPTO_FEE_PCT", "0.0025"))
@@ -119,10 +133,10 @@ DNA = {
     'base_risk_per_trade': 0.005,
     'high_conviction_risk': 0.0075,
     'losing_streak_factor': 0.60,
-    'max_positions': 4,
-    'max_crypto_positions': 2,
-    'max_single_exposure': 0.22,
-    'max_total_exposure': 0.78,
+    'max_positions': int(os.environ.get("MAX_POSITIONS", "4")),
+    'max_crypto_positions': int(os.environ.get("MAX_CRYPTO_POSITIONS", "2")),
+    'max_single_exposure': float(os.environ.get("MAX_SINGLE_EXPOSURE", "0.15")),
+    'max_total_exposure': float(os.environ.get("MAX_TOTAL_EXPOSURE", "0.40")),
 
     'stop_atr_mult': 2.5,
     'min_stop_pct': 0.018,
@@ -1075,6 +1089,29 @@ def execute_partial_scale_out(tc, symbol, pos_symbol, pos, is_crypto, new_stop_p
         return False
 
 
+def compute_trailing_stop(entry, live_price, cur_stop, init_stop_pct, scaled_out, m, cost_rt):
+    """Singura sursă de adevăr pentru stop: folosită de ratchet_stop (live) și de simularea din backtest."""
+    profit = live_price / entry - 1.0
+    max_allowed_floor = min(entry * (1.0 - init_stop_pct), live_price * (1.0 - init_stop_pct))
+    # la +0.5R reducem riscul la jumătate; breakeven + trailing vin mai departe, la breakeven_trigger_r
+    if profit >= init_stop_pct * DNA['half_risk_trigger_r']:
+        max_allowed_floor = max(max_allowed_floor, entry * (1.0 - init_stop_pct * 0.5))
+
+    new_stop = max(cur_stop, max_allowed_floor) if cur_stop else max_allowed_floor
+
+    already_in_profit_stop = (cur_stop is not None and cur_stop >= entry) or scaled_out
+    if profit >= init_stop_pct * DNA['breakeven_trigger_r'] or already_in_profit_stop:
+        peak_val = max(live_price, m['peak_since_entry'])
+        eff_trail_mult = DNA['trail_atr_mult'] * (0.80 if m['pd_pos'] >= 0.78 else 1.0)
+        trail = peak_val - eff_trail_mult * m['atr']
+        new_stop = max(new_stop, trail, entry * (1.0 + cost_rt + 0.001))
+
+    new_stop = min(new_stop, live_price * 0.992)
+    if cur_stop is not None:
+        new_stop = max(new_stop, cur_stop)
+    return new_stop
+
+
 def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
     entry = float(pos.avg_entry_price)
     avail_qty = float(getattr(pos, 'qty_available', None) or pos.qty)
@@ -1095,25 +1132,9 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
             pos_mem['scaled_out'] = True
             return lock_stop
 
-    max_allowed_floor = min(entry * (1.0 - init_stop_pct), live_price * (1.0 - init_stop_pct))
-    # FIX V10.2: înainte stop-ul sărea la -0.8% de la intrare imediat ce profitul trecea de +0.8% (zgomot normal pe 15m).
-    # Acum: la +0.5R reducem riscul la jumătate; breakeven + trailing vin mai departe, la 0.85R.
-    if profit >= init_stop_pct * DNA['half_risk_trigger_r']:
-        max_allowed_floor = max(max_allowed_floor, entry * (1.0 - init_stop_pct * 0.5))
-
-    new_stop = max(cur_stop, max_allowed_floor) if cur_stop else max_allowed_floor
-
-    already_in_profit_stop = (cur_stop is not None and cur_stop >= entry) or scaled_out
-    if profit >= init_stop_pct * DNA['breakeven_trigger_r'] or already_in_profit_stop:
-        peak_val = max(live_price, m['peak_since_entry'])
-        eff_trail_mult = DNA['trail_atr_mult'] * (0.80 if m['pd_pos'] >= 0.78 else 1.0)
-        trail = peak_val - eff_trail_mult * m['atr']
-        new_stop = max(new_stop, trail, entry * (1.0 + cost_rt + 0.001))
-
-    new_stop = min(new_stop, live_price * 0.992)
+    new_stop = compute_trailing_stop(entry, live_price, cur_stop, init_stop_pct, scaled_out, m, cost_rt)
 
     if cur_stop is not None:
-        new_stop = max(new_stop, cur_stop)
         if new_stop <= cur_stop * 1.0030:
             return cur_stop
         tc.cancel_order_by_id(cur.id)
@@ -1122,7 +1143,7 @@ def ratchet_stop(tc, symbol, pos_symbol, pos, m, is_crypto, cost_rt, pos_mem):
             fresh_pos = tc.get_open_position(pos_symbol)
             q_to_stop = float(getattr(fresh_pos, 'qty_available', None) or fresh_pos.qty)
             placed = place_stop(tc, symbol, q_to_stop, new_stop, is_crypto)
-            print(f"   🛡️ [SL ACTUALIZAT V10.2] {symbol}: {cur_stop:.4f} -> {placed}")
+            print(f"   🛡️ [SL ACTUALIZAT V10.3] {symbol}: {cur_stop:.4f} -> {placed}")
             return placed
         except Exception as e:
             print(f"   ⚠️ Stop nou respins ({e}); refac stop-ul anterior")
@@ -1172,7 +1193,7 @@ def manage_position(tc, symbol, pos, m, is_crypto, pos_mem, flatten_now=False):
     reason = "Închidere înainte de bell" if flatten_now \
         else exit_decision(profit, m, init_stop_pct, cost_rt, market_val=market_val, scaled_out=scaled_out)
     if reason:
-        print(f"   🔔 [IEȘIRE V10.2] {symbol}: {reason} ({profit*100:+.2f}%)")
+        print(f"   🔔 [IEȘIRE V10.3] {symbol}: {reason} ({profit*100:+.2f}%)")
         return close_position_safe(tc, symbol, pos_symbol)
 
     try:
@@ -1315,6 +1336,35 @@ def process_symbol(tc, symbol, pack, is_crypto, is_safe, held, ctx):
         'setup': m['setup']})
 
 
+LISTED_NORM = {norm(s) for s in ALL_CRYPTO + ALL_STOCKS}
+
+
+def protect_foreign_positions(tc, held):
+    """Poziții cu simboluri din afara listelor botului nu sunt scanate/gestionate: măcar le punem un stop și avertizăm."""
+    foreign = {s: p for s, p in held.items() if s not in LISTED_NORM}
+    if not foreign:
+        return
+    total = sum(abs(float(getattr(p, 'market_value', 0.0) or 0.0)) for p in foreign.values())
+    print(f"⚠️ [POZIȚII NEGESTIONATE] {', '.join(sorted(foreign))} ({total:,.0f}$) nu sunt în lista botului: "
+          f"nu au trailing/ieșiri, doar stop de protecție.")
+    open_orders = get_open_orders(tc)
+    for s, p in foreign.items():
+        try:
+            if find_stop_order(open_orders, s) is not None:
+                continue
+            qty = float(getattr(p, 'qty_available', None) or p.qty)
+            if qty <= 0:
+                continue
+            is_crypto = 'crypto' in str(getattr(p, 'asset_class', '')).lower()
+            entry = float(p.avg_entry_price)
+            live = float(getattr(p, 'current_price', None) or entry)
+            stop = min(entry * (1.0 - DNA['min_stop_pct'] * 1.5), live * 0.985)
+            placed = place_stop(tc, p.symbol, qty, stop, is_crypto)
+            print(f"   🛡️ [STOP PROTECȚIE] {s}: stop plantat la {placed}")
+        except Exception as e:
+            print(f"   ⚠️ Nu pot proteja {s}: {e}")
+
+
 def open_new_positions(tc, ctx, held, equity):
     crypto_set = {norm(s) for s in ALL_CRYPTO}
     open_syms = [s for s in held if s not in ctx['closed']]
@@ -1324,8 +1374,10 @@ def open_new_positions(tc, ctx, held, equity):
 
     for t in sorted(ctx['candidates'], key=lambda x: x['score'], reverse=True):
         if n_open >= DNA['max_positions']:
+            print(f"   ⛔ [LIMITĂ POZIȚII] {n_open}/{DNA['max_positions']} deschise: nu intru pe semnalele noi.")
             break
         if t['is_crypto'] and crypto_open >= DNA['max_crypto_positions']:
+            print(f"   ⛔ [LIMITĂ CRYPTO] Sar peste {t['symbol']}: {crypto_open}/{DNA['max_crypto_positions']} crypto deschise.")
             continue
         if is_correlated_with_held(t['pos_symbol'], open_syms):
             print(f"   🔗 [ANTI-DUBLARE] Sar peste {t['symbol']} (avem deja un activ identic/corelat în portofoliu).")
@@ -1334,9 +1386,11 @@ def open_new_positions(tc, ctx, held, equity):
             cash = float(tc.get_account().cash)
             invest = position_size_usd(equity, cash, gross, t['init_stop_pct'], t['score'], ctx['loss_streak'])
             if invest < MIN_POSITION_USD:
+                print(f"   💤 [FĂRĂ LOC] Sar peste {t['symbol']}: alocare {invest:,.0f}$ < minim {MIN_POSITION_USD:,.0f}$ "
+                      f"(expunere {gross / equity * 100:.0f}% din plafon {DNA['max_total_exposure'] * 100:.0f}%)")
                 continue
             sym, pos_sym = t['symbol'], t['pos_symbol']
-            print(f"🎯 [INTRARE V10.2] {sym}: ~{invest:.0f}$ | Stop: -{t['init_stop_pct']*100:.2f}% "
+            print(f"🎯 [INTRARE V10.3] {sym}: ~{invest:.0f}$ | Stop: -{t['init_stop_pct']*100:.2f}% "
                   f"| Scor {t['score']} ({t['reason']})")
 
             if not submit_smart_buy(tc, sym, invest, t['price'], t['is_crypto'], t.get('setup', 'NA')):
@@ -1399,7 +1453,7 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val,
     kz_name, kz_bonus, is_asian_accum = get_ict_session_info(now)
     gen_num = learned_mem.get("generation", 1)
 
-    print(f"\n⚡ Scanare V10.2 Gen#{gen_num} ({kz_name}): {now.strftime('%H:%M:%S UTC')} "
+    print(f"\n⚡ Scanare V10.3 Gen#{gen_num} ({kz_name}): {now.strftime('%H:%M:%S UTC')} "
           f"| Equity: {equity:,.2f}$ | Peak gen: {gen_start_eq:,.0f}$ | Băgați în poziții: {invested_now:,.0f}$ "
           f"| Pierdere/Investit: -{loss_pct_of_invested*100:.1f}% (Prag Rebirth -20%: {rebirth_equity_floor:,.0f}$) | Azi: {daily_pnl*100:+.2f}%")
     if entries_blocked:
@@ -1476,8 +1530,275 @@ def run_cycle(tc, crypto_client, stock_client, social_scores, fear_greed_val,
         for symbol, pack in stock_packs.items():
             process_symbol(tc, symbol, pack, False, symbol in SAFE_HAVEN_STOCKS, held, ctx)
 
+    protect_foreign_positions(tc, held)
+
     if ctx['candidates'] and not entries_blocked:
         open_new_positions(tc, ctx, held, equity)
+
+
+# ==========================================
+# 8b. BACKTEST (python github_champion.py --backtest --days 30)
+# ==========================================
+BACKTEST_PREFERRED = {"SPY", "QQQ", "GLD", "PAXGUSD", "BTCUSD", "NVDA"}
+
+
+def load_backtest_gate(max_age_days=14):
+    """Setup-urile pe care ultimul backtest (mai nou de 14 zile) le-a găsit cu expectanță negativă."""
+    try:
+        with open(BACKTEST_FILE, "r", encoding="utf-8") as f:
+            rep_ = json.load(f)
+        ts = datetime.fromisoformat(str(rep_["generated_at"]))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - ts > timedelta(days=max_age_days):
+            return set()
+        return set(rep_.get("disable_setups", []))
+    except Exception:
+        return set()
+
+
+def fetch_backtest_frames(crypto_client, stock_client, days):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days + 4)
+    frames = {}
+    try:
+        cb = crypto_client.get_crypto_bars(CryptoBarsRequest(
+            symbol_or_symbols=ALL_CRYPTO, timeframe=bar_tf(), start=start, end=end)).df
+        have = set(cb.index.get_level_values(0))
+        for s in ALL_CRYPTO:
+            if s in have:
+                frames[s] = (cb.xs(s), True)
+    except Exception as e:
+        print(f"   ⚠️ Nu pot descărca istoricul crypto: {e}")
+    try:
+        sb = stock_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=ALL_STOCKS, timeframe=bar_tf(), start=start, end=end, feed=DataFeed.IEX)).df
+        have = set(sb.index.get_level_values(0))
+        for s in ALL_STOCKS:
+            if s in have:
+                df = filter_regular_stock_hours(sb.xs(s))
+                if not df.empty:
+                    frames[s] = (df, False)
+    except Exception as e:
+        print(f"   ⚠️ Nu pot descărca istoricul acțiunilor: {e}")
+    return frames
+
+
+def precompute_signals(frames):
+    """Semnalul pe fiecare lumânare închisă. Nu depinde de parametrii de management, deci se calculează o singură dată."""
+    out = {}
+    btc_ret = None
+    if "BTC/USD" in frames and len(frames["BTC/USD"][0]) > 120:
+        btc_ret = compute_indicators(frames["BTC/USD"][0])['ret_4h']
+    bar_td = timedelta(minutes=DNA['bar_minutes'])
+    for sym, (df, is_crypto) in frames.items():
+        if len(df) < 130:
+            continue
+        ind = compute_indicators(df)
+        is_safe = sym in SAFE_HAVEN_CRYPTO or sym in SAFE_HAVEN_STOCKS
+        is_pref = norm(sym) in BACKTEST_PREFERRED
+        idx = ind.index
+        ms = [None] * len(ind)
+        for i in range(100, len(ind)):
+            _, kz_bonus, is_asian = get_ict_session_info(idx[i] + bar_td)
+            btc_r = None
+            if btc_ret is not None and is_crypto and sym != "BTC/USD" and not is_safe:
+                v = btc_ret.get(idx[i], np.nan)
+                btc_r = float(v) if np.isfinite(v) else None
+            m = signal_at(ind, i, 0, live_price=None, btc_ret_4h=btc_r, kz_bonus=kz_bonus,
+                          is_preferred=is_pref, is_crypto=is_crypto)
+            m['_asian'] = is_asian
+            ms[i] = m
+        out[sym] = (ind, ms, is_crypto)
+        print(f"   · {sym}: {len(ind)} lumânări, semnale pregătite")
+    return out
+
+
+def simulate_symbol(sym, ind, ms, is_crypto, disabled=frozenset()):
+    """Simulează o poziție pe rând pe simbol, cu aceeași logică de stop/partial/ieșire ca botul live (nivel de lumânare 15m)."""
+    trades = []
+    n = len(ind)
+    O, H, L, C = (ind[c].values.astype(float) for c in ('open', 'high', 'low', 'close'))
+    idx = ind.index
+    bar_td = timedelta(minutes=DNA['bar_minutes'])
+    cost_rt = round_trip_cost(is_crypto)
+    slip = CRYPTO_SLIPPAGE_PCT if is_crypto else STOCK_SLIPPAGE_PCT
+    fee = CRYPTO_FEE_PCT if is_crypto else 0.0
+    cooldown_bars = max(1, int(DNA['reentry_cooldown_min'] // DNA['bar_minutes']))
+    i = 100
+    while i < n - 2:
+        m = ms[i]
+        if m is None or m['setup'] is None or m['setup'] in disabled:
+            i += 1
+            continue
+        if not is_crypto:
+            ny = (idx[i] + bar_td).astimezone(NY_TZ)
+            mtc = 960 - (ny.hour * 60 + ny.minute)      # minute până la 16:00 NY
+            if not (30 <= mtc <= 380):
+                i += 1
+                continue
+        if not entry_allowed(m, cost_rt, m.get('_asian', False), is_crypto):
+            i += 1
+            continue
+
+        e = i + 1
+        entry = O[e] * (1.0 + slip)
+        isp = stop_distance_pct(m)
+        stop = entry * (1.0 - isp)
+        peak = entry
+        scaled = False
+        remaining = 1.0
+        fills = []
+        why = 'END'
+        j = e
+        while j < n:
+            o, h, l, c = O[j], H[j], L[j], C[j]
+            if l <= stop:                                  # stop lovit (gap-ul se plătește: min(open, stop))
+                fills.append((remaining, min(o, stop) * (1.0 - slip)))
+                remaining = 0.0
+                why = 'STOP_RUNNER' if scaled else 'STOP'
+                break
+            peak = max(peak, h)
+            mj = ms[j]
+            if mj is None:
+                break
+            if DNA['use_partial_tp'] and not scaled:
+                tgt = entry * (1.0 + cost_rt + isp * DNA['partial_tp_r'])
+                if h >= tgt:
+                    fills.append((0.5, tgt * (1.0 - slip)))
+                    remaining = 0.5
+                    scaled = True
+                    lock = min(c * 0.992, max(entry * (1.0 + cost_rt + 0.003), peak - DNA['trail_atr_mult'] * mj['atr']))
+                    stop = max(stop, lock)
+            profit = c / entry - 1.0
+            mm = dict(mj)
+            mm['price'] = c
+            mm['peak_since_entry'] = max(peak, c)
+            if exit_decision(profit, mm, isp, cost_rt, market_val=1e9, scaled_out=scaled):
+                fills.append((remaining, c * (1.0 - slip)))
+                remaining = 0.0
+                why = 'SEMNAL'
+                break
+            stop = max(stop, compute_trailing_stop(entry, c, stop, isp, scaled, mm, cost_rt))
+            j += 1
+        if remaining > 0:
+            fills.append((remaining, C[min(j, n - 1)] * (1.0 - slip)))
+        gross = sum(f * (px / entry - 1.0) for f, px in fills)
+        net = gross - 2.0 * fee                           # comision la intrare + la ieșiri (total 100% din poziție)
+        trades.append({'sym': sym, 'setup': m['setup'], 'entry_ts': idx[e], 'bars': max(j, e) - e + 1,
+                       'net': net, 'r': net / isp, 'why': why, 'crypto': is_crypto})
+        i = max(j, e) + 1 + cooldown_bars
+    return trades
+
+
+def run_variant(sim_data, overrides, disabled=frozenset()):
+    saved = {k: DNA[k] for k in overrides}
+    try:
+        DNA.update(overrides)
+        trades = []
+        for sym, (ind, ms, is_crypto) in sim_data.items():
+            trades += simulate_symbol(sym, ind, ms, is_crypto, disabled)
+        return trades
+    finally:
+        DNA.update(saved)
+
+
+def summarize_trades(trades):
+    n = len(trades)
+    if n == 0:
+        return {'n': 0, 'wr': 0.0, 'pf': 0.0, 'avg_w': 0.0, 'avg_l': 0.0, 'exp': 0.0, 'sum_pct': 0.0}
+    nets = np.array([t['net'] for t in trades], dtype=float)
+    wins, losses = nets[nets > 0], nets[nets <= 0]
+    gw, gl = float(wins.sum()), float(abs(losses.sum()))
+    pf = gw / gl if gl > 0 else (99.0 if gw > 0 else 0.0)
+    return {'n': n, 'wr': len(wins) / n * 100, 'pf': round(pf, 2),
+            'avg_w': float(wins.mean() * 100) if len(wins) else 0.0,
+            'avg_l': float(abs(losses.mean()) * 100) if len(losses) else 0.0,
+            'exp': float(nets.mean() * 100), 'sum_pct': float(nets.sum() * 100)}
+
+
+def fmt_stats(label, st):
+    return (f"{label:<26} n={st['n']:<4} WR={st['wr']:5.1f}% | PF={st['pf']:5.2f} | "
+            f"câștig med +{st['avg_w']:.2f}% / pierdere med -{st['avg_l']:.2f}% | expectanță {st['exp']:+.2f}%/tranzacție")
+
+
+def run_backtest(crypto_client, stock_client, days):
+    print(f"🧪 BACKTEST {days} zile | lumânări {DNA['bar_minutes']}m | comision crypto {CRYPTO_FEE_PCT*100:.2f}%/parte + slippage")
+    print("   (nivel de lumânare, o poziție pe simbol, fără limite de portofoliu; stop-urile se verifică pe low-ul lumânării)")
+    frames = fetch_backtest_frames(crypto_client, stock_client, days)
+    if not frames:
+        print("❌ Nu am primit date de piață. Verifică cheile Alpaca.")
+        return
+    sim_data = precompute_signals(frames)
+    if not sim_data:
+        print("❌ Prea puține lumânări pentru simulare.")
+        return
+
+    trades = run_variant(sim_data, {})
+    base = summarize_trades(trades)
+    print("\n" + "=" * 90)
+    print(fmt_stats("TOTAL (parametrii actuali)", base))
+    print(fmt_stats("  crypto", summarize_trades([t for t in trades if t['crypto']])))
+    print(fmt_stats("  acțiuni/ETF", summarize_trades([t for t in trades if not t['crypto']])))
+
+    per_setup = {}
+    for tag in sorted({t['setup'] for t in trades}):
+        per_setup[tag] = summarize_trades([t for t in trades if t['setup'] == tag])
+        print(fmt_stats(f"  setup {tag}", per_setup[tag]))
+    for why in sorted({t['why'] for t in trades}):
+        print(fmt_stats(f"  ieșire {why}", summarize_trades([t for t in trades if t['why'] == why])))
+
+    per_sym = {}
+    for sym in sorted({t['sym'] for t in trades}):
+        per_sym[sym] = summarize_trades([t for t in trades if t['sym'] == sym])
+    worst = sorted(per_sym.items(), key=lambda kv: kv[1]['sum_pct'])[:5]
+    best = sorted(per_sym.items(), key=lambda kv: -kv[1]['sum_pct'])[:5]
+    print("\n   Cele mai slabe simboluri: " + ", ".join(f"{k} ({v['sum_pct']:+.1f}%, n={v['n']})" for k, v in worst))
+    print("   Cele mai bune simboluri:  " + ", ".join(f"{k} ({v['sum_pct']:+.1f}%, n={v['n']})" for k, v in best))
+
+    disable = [tag for tag, st in per_setup.items() if st['n'] >= 15 and st['pf'] < 0.9 and st['exp'] < 0]
+    if disable:
+        print(f"\n⛔ Setup-uri cu expectanță negativă (n>=15, PF<0.9) -> dezactivate în live: {', '.join(disable)}")
+
+    # --- test in-sample (primele 2/3) vs out-of-sample (ultima treime) pentru variante de parametri ---
+    t_min = min(ind.index[100] for ind, _, _ in sim_data.values())
+    t_max = max(ind.index[-1] for ind, _, _ in sim_data.values())
+    cutoff = t_min + (t_max - t_min) * 2 / 3
+    results = []
+    for min_stop in (0.012, 0.018, 0.025):
+        for be in (0.85, 1.3):
+            for ptp in (1.0, 1.35, 2.0):
+                for sc in (73, 78):
+                    ov = {'min_stop_pct': min_stop, 'max_stop_pct': max(0.030, min_stop + 0.005),
+                          'breakeven_trigger_r': be, 'partial_tp_r': ptp, 'entry_score_min': sc}
+                    tr = run_variant(sim_data, ov, frozenset(disable))
+                    results.append((ov, summarize_trades([t for t in tr if t['entry_ts'] < cutoff]),
+                                    summarize_trades([t for t in tr if t['entry_ts'] >= cutoff])))
+    ranked = sorted([r for r in results if r[1]['n'] >= 20], key=lambda r: -r[1]['pf'])[:6]
+    print(f"\n📊 Top variante după PF pe primele 2/3 (până la {cutoff:%Y-%m-%d}) și verificate pe ultima treime (nevăzută la alegere):")
+    for ov, tr_st, te_st in ranked:
+        print(f"   stop_min={ov['min_stop_pct']*100:.1f}% breakeven={ov['breakeven_trigger_r']} partial={ov['partial_tp_r']} scor>={ov['entry_score_min']}"
+              f" | TRAIN PF={tr_st['pf']:.2f} (n={tr_st['n']}) | TEST PF={te_st['pf']:.2f} (n={te_st['n']}, exp {te_st['exp']:+.2f}%)")
+    robust = [r for r in ranked if r[2]['n'] >= 8 and r[2]['pf'] > 1.0]
+    if robust:
+        print("   ✅ Variante care rămân profitabile și pe perioada nevăzută: " + str(len(robust)) + " din top " + str(len(ranked)))
+    else:
+        print("   ⚠️ Nicio variantă din top nu rămâne profitabilă pe ultima treime: nu există dovadă de avantaj statistic. "
+              "Nu schimba parametrii după acest raport.")
+    print("   Atenție: istoric scurt, o singură piață. Rezultatele sunt orientative, nu o garanție.")
+    print("=" * 90)
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(), "days": days,
+        "baseline": base, "per_setup": per_setup, "disable_setups": disable,
+        "top_variants": [{"params": ov, "train": a, "test": b} for ov, a, b in ranked],
+    }
+    try:
+        with open(BACKTEST_FILE, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False, default=float)
+        persist_files_to_github([BACKTEST_FILE], f"📊 Backtest {days}z: PF {base['pf']:.2f}, n={base['n']}")
+    except Exception as e:
+        print(f"   ⚠️ Nu am putut salva {BACKTEST_FILE}: {e}")
 
 
 # ==========================================
@@ -1497,6 +1818,10 @@ def main():
     crypto_client = CryptoHistoricalDataClient(API_KEY, SECRET_KEY)
     stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
+    if args.backtest:
+        run_backtest(crypto_client, stock_client, args.days)
+        return
+
     first_run = not os.path.exists(MEMORY_FILE)
     init_eq = float(tc.get_account().equity)
     learned_mem = load_learned_memory(init_eq)
@@ -1507,11 +1832,16 @@ def main():
     if first_run:
         persist_files_to_github([MEMORY_FILE], "💾 Init memorie Gen #1")
 
-    print(f"🚀 AGENT V10.2 PHOENIX (Gen #{learned_mem.get('generation', 1)}) pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) "
+    print(f"🚀 AGENT V10.3 PHOENIX (Gen #{learned_mem.get('generation', 1)}) pornit ({'PAPER' if PAPER else '⚠️ LIVE'}) "
           f"| Prag Rebirth: -20% din banii băgați în poziții | Scor min: {DNA['entry_score_min']}")
 
     social_scores, fear_greed_val = scan_social_media_and_sentiment()
     pos_memory, cooldown_syms, loss_streak, sym_stats = analyze_closed_trades_and_learn(tc, learned_mem)
+
+    extra_disabled = {x.strip() for x in os.environ.get("DISABLED_SETUPS", "").split(",") if x.strip()}
+    if USE_BACKTEST_GATE:
+        extra_disabled |= load_backtest_gate()
+    learned_mem["disabled_setups"] = sorted(set(learned_mem.get("disabled_setups", [])) | extra_disabled)
 
     if cooldown_syms:
         print(f"🧊 Monede blocate temporar de Motorul de Învățare: {', '.join(sorted(cooldown_syms))}")
