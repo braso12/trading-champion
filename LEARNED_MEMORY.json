@@ -8,13 +8,17 @@
     "SPY",
     "QQQ",
     "GLD",
-    "PAXGUSD",
     "BTCUSD",
-    "NVDA"
+    "NVDA",
+    "AAPL",
+    "TSLA",
+    "TLT"
   ],
   "score_boost_req": 0,
-  "min_stop_override": 0.018,
-  "partial_tp_r_override": 1.35,
-  "lessons_learned": [],
+  "min_stop_override": 0.0040,
+  "partial_tp_r_override": 1.40,
+  "lessons_learned": [
+    "Upgrade V11.0 OrientFX Institutional Edition: plafon expunere crescut la 75% (deblocat din 40%), stop scalat real la ATR (0.40%-1.10% acțiuni vs 1.80%-3.20% crypto), reparat bug-ul live_price*0.992 din compute_trailing_stop (acum 0.9988), Take-Partial 30% la +1.40R + Take-Profit complet la +2.50R, intrări doar în H1 Discount Pocket cu pullback controlat (-0.6 la -4.5 ATR) și fereastră NY Killzone (09:55-14:45 NY)."
+  ],
   "autopsy_history": []
 }
