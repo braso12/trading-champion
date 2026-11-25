@@ -1926,6 +1926,28 @@ def main():
         run_backtest(crypto_client, stock_client, args.days)
         return
 
+    if os.path.exists("SHUTDOWN.lock"):
+        print("🛑 [SHUTDOWN] SHUTDOWN.lock găsit: anulez ordinele și închid TOATE pozițiile, apoi ies.")
+        try:
+            tc.cancel_orders()
+        except Exception as e:
+            print(f"   ⚠️ cancel_orders: {e}")
+        time.sleep(1.5)
+        try:
+            tc.close_all_positions(cancel_orders=True)
+        except Exception as e:
+            print(f"   ⚠️ close_all_positions: {e}")
+        remaining = []
+        for _ in range(12):
+            time.sleep(5)
+            remaining = tc.get_all_positions()
+            if not remaining:
+                break
+        acct = tc.get_account()
+        print(f"🛑 [SHUTDOWN] Poziții rămase: {len(remaining)} {[p.symbol for p in remaining]} | "
+              f"Ordine deschise: {len(get_open_orders(tc))} | Equity: {float(acct.equity):,.2f}$ | Cash: {float(acct.cash):,.2f}$")
+        return
+
     first_run = not os.path.exists(MEMORY_FILE)
     init_eq = float(tc.get_account().equity)
     learned_mem = load_learned_memory(init_eq)
